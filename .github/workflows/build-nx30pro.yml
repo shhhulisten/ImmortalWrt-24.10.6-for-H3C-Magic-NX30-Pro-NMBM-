@@ -21,6 +21,9 @@ env:
   #     所以每次编译出来的包版本与官方发布版一致，而不是跟着分支漂移。
   # 若改了这里，务必同时核对 VERSION_REPO 与下面的 VERMAGIC 期望值。
   SRC_TAG: v24.10.6
+  # passwall2 额外 feed 的 commit SHA。留空 = 跟随上游 main（会漂移）。
+  # 首次编译成功后，把日志里打印的 "passwall2 feed 当前提交" 填到这里即可固定版本。
+  PASSWALL2_REF: ""
   # 官方 24.10.6 内核的 vermagic（来源：发布站 kmods 目录名）。
   # 我们自编译的内核配置不同，vermagic 必然与之不同 —— 这是正常且预期的，
   # 下面只把它打印出来，便于你日后确认「哪些 kmod 是本固件自带的」。
@@ -115,11 +118,32 @@ jobs:
             ccache-nx30pro-${{ env.SRC_TAG }}-
             ccache-nx30pro-
 
+      # ---------------------------------------------------------------
+      # passwall2 不在 ImmortalWrt v24.10.6 锁定的 luci feed 里（实测：
+      # package/feeds/luci/luci-app-passwall2 不存在），所以把官方仓库
+      # 作为额外 feed 加进来。它只提供 luci-app-passwall2 这一个界面包，
+      # xray-core / hysteria / geoview 等依赖仍来自已锁定的 packages feed。
+      #
+      # 注意：这个 feed 默认跟随 main 分支，版本会随时间漂移。
+      # 编译成功后想固定版本，把 env 里的 PASSWALL2_REF 填成 commit SHA。
+      # ---------------------------------------------------------------
       - name: Update and install feeds
         run: |
           cd openwrt
+          cp feeds.conf.default feeds.conf
+          if [ -n "${PASSWALL2_REF}" ]; then
+            echo "src-git passwall2 https://github.com/Openwrt-Passwall/openwrt-passwall2.git^${PASSWALL2_REF}" >> feeds.conf
+          else
+            echo "src-git passwall2 https://github.com/Openwrt-Passwall/openwrt-passwall2.git" >> feeds.conf
+            echo "::warning::passwall2 feed 未锁定 commit，版本会随上游 main 漂移（编译成功后建议填 PASSWALL2_REF）"
+          fi
+          cat feeds.conf
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+          # 兜底：确保 passwall2 界面包来自这个 feed
+          ./scripts/feeds install -f -p passwall2 luci-app-passwall2
+          echo "passwall2 feed 当前提交: $(git -C feeds/passwall2 rev-parse HEAD 2>/dev/null || echo 未知)"
+          ls -la package/feeds/passwall2/ || true
 
       # ---------------------------------------------------------------
       # 装载配置并做硬校验。
@@ -217,9 +241,8 @@ jobs:
             chk_on "CONFIG_PACKAGE_luci-i18n-$p-zh-cn" "该应用的汉化包缺失，界面会是英文"
           done
 
-          if [ ! -d package/feeds/luci/luci-app-passwall2 ]; then
-            echo "::error::package/feeds/luci/luci-app-passwall2 不存在 —— 锁定的 luci feed 提交里没有 passwall2，"
-            echo "          需要改用 Openwrt-Passwall/openwrt-passwall2 作为额外 feed（见 README / 对话说明）"
+          if [ ! -d package/feeds/passwall2/luci-app-passwall2 ]; then
+            echo "::error::package/feeds/passwall2/luci-app-passwall2 不存在 —— passwall2 额外 feed 未正确安装"
             fail=1
           fi
 
