@@ -99,6 +99,27 @@ jobs:
             echo "::warning::feeds.conf.default 未锁定到具体 commit，本次构建的包版本可能漂移"
           fi
 
+      - name: Update Feeds & Setup PassWall 2 (Fake-IP)
+        run: |
+          cd openwrt
+
+          # 1. 更新官方 feeds 索引
+          ./scripts/feeds update -a
+
+          # 2. 升级 Golang 至 1.23+，满足最新 Xray 与 Sing-Box 编译要求
+          rm -rf feeds/packages/lang/golang
+          git clone --depth=1 https://github.com/sbwml/packages_lang_golang -b 23.x feeds/packages/lang/golang
+
+          # 3. 引入 PassWall 2 主包及配套依赖核心（支持 Fake-IP 与 Sing-Box 规则分流）
+          git clone --depth=1 https://github.com/xiaorouji/openwrt-passwall2.git package/passwall2
+          git clone --depth=1 https://github.com/xiaorouji/openwrt-passwall-packages.git package/passwall-packages
+
+          # 4. 剔除易产生构建冲突的过时依赖插件
+          rm -rf package/passwall-packages/v2ray-plugin
+
+          # 5. 安装 feeds 并建立软链接到 package/feeds
+          ./scripts/feeds install -a
+
       # ---------------------------------------------------------------
       # ccache：第二次及以后的编译能从数小时降到几十分钟。
       # 首次编译没有命中，属于正常现象。
@@ -327,51 +348,62 @@ jobs:
           mkdir -p "$RUNNER_TEMP/blog"
           LOG="$RUNNER_TEMP/blog/build.log"
           rc=0
-          # 并行阶段：全量落盘、不上屏（几百 MB，上屏只会把界面刷爆）
-          if ! make -j$(nproc) > "$LOG" 2>&1; then
-            echo "并行编译失败，改用单线程带详细日志重跑（其余包已编完，只重试失败处）"
-            make -j1 V=s >> "$LOG" 2>&1 || rc=1
-          fi
-          if [ "$rc" = "0" ]; then exit 0; fi
 
-          # ---------- 失败：先把原因推进公开通道，再以失败退出 ----------
-          # 转义顺序：% 必须最先转，否则行内原有的 % 会被当成转义引导符
+          echo "==== 开始多线程并行编译 ===="
+          # 并行阶段：全量落盘，避免几百 MB 日志直接冲垮 GitHub Web 界面
+          if ! make -j$(nproc) > "$LOG" 2>&1; then
+            echo "::warning::多线程并行构建遇到错误，开始启用单线程详细模式 (V=s) 精确重试并定位..."
+            # 单线程阶段：使用 tee 同步输出到控制台与日志文件，防止长时间无控制台输出触发 Actions 超时，且能实时追踪卡点
+            make -j1 V=s 2>&1 | tee -a "$LOG" || rc=1
+          fi
+
+          if [ "$rc" = "0" ]; then
+            echo "==== 固件编译顺利完成 ===="
+            exit 0
+          fi
+
+          # ---------- 编译失败诊断与上报 ----------
           esc() { sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN{ORS=""} {print $0 "%0A"}'; }
 
           if [ ! -f "$LOG" ]; then
-            echo "::error title=编译失败::未找到编译日志 $LOG —— 失败可能发生在 make 之前"
+            echo "::error title=编译失败::未找到编译日志 $LOG —— 失败可能发生在 make 命令执行前"
             exit 1
           fi
 
-          echo "编译日志共 $(wc -l < "$LOG") 行 / $(du -h "$LOG" | cut -f1)"
-          ERRS=$(grep -nE 'make(\[[0-9]+\])?: \*\*\*|Error [0-9]+$|error:|fatal error:|undefined reference|No rule to make target|failed to build' "$LOG" | tail -n 60)
-          TAILB=$(tail -n 60 "$LOG")
+          echo "编译日志总计 $(wc -l < "$LOG") 行 / $(du -h "$LOG" | cut -f1)"
 
+          # 增强型错误正则：覆盖 Makefile、C/C++、Go 运行时、Rust 编译与内核模块错误
+          ERR_REGEX='make(\[[0-9]+\])?: \*\*\*|Error [0-9]+$|error:|fatal error:|undefined reference|No rule to make target|failed to build|build failed|panic:|syntax error|collect2: error:'
+          ERRS=$(grep -nE "$ERR_REGEX" "$LOG" | tail -n 80)
+          TAILB=$(tail -n 80 "$LOG")
+
+          # 写入 GitHub Step Summary 提供可视化复盘看板
           {
-            echo "### 编译失败诊断（run ${{ github.run_number }}）"
+            echo "### ❌ 固件编译失败诊断报告（Run #${{ github.run_number }}）"
             echo
-            echo "编译日志共 $(wc -l < "$LOG") 行。"
+            echo "- **日志总量**：$(wc -l < "$LOG") 行 ($(du -h "$LOG" | cut -f1))"
             echo
-            echo '**① 典型错误行（grep，最多 60 条）**'
-            echo '```'
-            if [ -n "$ERRS" ]; then printf '%s\n' "$ERRS"; else echo "(没有匹配到典型错误行，看下面日志尾部)"; fi
+            echo '#### ① 捕获的致命错误（最多显示 80 条）'
+            echo '```text'
+            if [ -n "$ERRS" ]; then printf '%s\n' "$ERRS"; else echo "(未匹配到常见特征行，请参阅下方日志尾部内容)"; fi
             echo '```'
             echo
-            echo '**② 日志尾部 60 行**'
-            echo '```'
+            echo '#### ② 编译日志尾部 80 行'
+            echo '```text'
             printf '%s\n' "$TAILB"
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY:-/dev/null}" || true
 
-          echo "---- 典型错误行 ----"
-          if [ -n "$ERRS" ]; then printf '%s\n' "$ERRS"; else echo "(无匹配)"; fi
-          echo "---- 日志尾部 ----"
+          echo "---- 致命错误汇总 ----"
+          if [ -n "$ERRS" ]; then printf '%s\n' "$ERRS"; else echo "(无直接特征匹配)"; fi
+          echo "---- 日志最后 80 行 ----"
           printf '%s\n' "$TAILB"
 
+          # 触发 GitHub Actions 报错通知
           if [ -n "$ERRS" ]; then
-            echo "::error title=编译错误行（最多 60 条）::$(printf '%s\n' "$ERRS" | head -c 20000 | esc)"
+            echo "::error title=编译错误特征匹配::$(printf '%s\n' "$ERRS" | head -c 20000 | esc)"
           fi
-          echo "::error title=编译日志尾部 60 行::$(printf '%s\n' "$TAILB" | head -c 20000 | esc)"
+          echo "::error title=构建日志尾部输出::$(printf '%s\n' "$TAILB" | head -c 20000 | esc)"
           exit 1
 
       # ---------------------------------------------------------------
