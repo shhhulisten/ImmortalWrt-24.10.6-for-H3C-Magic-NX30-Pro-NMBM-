@@ -106,20 +106,18 @@ jobs:
           # 1. 更新官方 feeds 索引
           ./scripts/feeds update -a
 
-          # 2. 升级 Golang 至 1.23+，满足最新 Xray 与 Sing-Box 编译要求
+          # 2. 升级 Golang 至 1.23+（满足最新 Sing-Box 与 Xray 编译要求）
           rm -rf feeds/packages/lang/golang
           git clone --depth=1 https://github.com/sbwml/packages_lang_golang -b 23.x feeds/packages/lang/golang
 
-          # 3. 引入 PassWall 2 主包及配套依赖核心（支持 Fake-IP 与 Sing-Box 规则分流）
-          git clone --depth=1 https://github.com/xiaorouji/openwrt-passwall2.git package/passwall2
-          git clone --depth=1 https://github.com/xiaorouji/openwrt-passwall-packages.git package/passwall-packages
+          # 3. 清理已有的 passwall/helloworld 避免符号冲突
+          rm -rf package/helloworld package/passwall*
 
-          # 4. 剔除易产生构建冲突的过时依赖插件
-          rm -rf package/passwall-packages/v2ray-plugin
+          # 4. 克隆包含 PassWall 2 与全部核心依赖的开源仓库 (sbwml 维护源，原生含 passwall2/sing-box/xray)
+          git clone --depth=1 https://github.com/sbwml/openwrt_helloworld.git -b v5 package/helloworld
 
-          # 5. 安装 feeds 并建立软链接到 package/feeds
+          # 5. 安装 feeds 并重新生成索引
           ./scripts/feeds install -a
-
       # ---------------------------------------------------------------
       # ccache：第二次及以后的编译能从数小时降到几十分钟。
       # 首次编译没有命中，属于正常现象。
