@@ -1,5 +1,8 @@
 name: Build ImmortalWrt 24.10.6 for H3C NX30 Pro (NMBM)
 
+# 触发方式：
+#   1) 手动（Actions 页面 → Run workflow）—— 日常用这个
+#   2) push 改动到下面这两个路径时自动触发
 on:
   workflow_dispatch:
   push:
@@ -11,18 +14,35 @@ permissions:
   contents: write
 
 env:
+  # 上游源码的 tag。用 tag 而不是分支，是为了可复现：
+  #   · 该 tag 的 version.mk 里 VERSION_NUMBER 默认值就是 24.10.6、
+  #     VERSION_REPO 默认值就是官方 24.10.6 发布地址；
+  #   · 该 tag 的 feeds.conf.default 把四个 feed 全部锁定到具体 commit，
+  #     所以每次编译出来的包版本与官方发布版一致，而不是跟着分支漂移。
+  # 若改了这里，务必同时核对 VERSION_REPO 与下面的 VERMAGIC 期望值。
   SRC_TAG: v24.10.6
+  # 官方 24.10.6 内核的 vermagic（来源：发布站 kmods 目录名）。
+  # 我们自编译的内核配置不同，vermagic 必然与之不同 —— 这是正常且预期的，
+  # 下面只把它打印出来，便于你日后确认「哪些 kmod 是本固件自带的」。
   UPSTREAM_VERMAGIC: 6.6.133-1-a8b93917f464536104594f27d870028d
 
 jobs:
   build:
+    # ubuntu-latest 目前是 24.04。若日后依赖包名变动导致安装失败，
+    # 可改回 ubuntu-22.04（镜像更老但包名稳定）。
     runs-on: ubuntu-latest
+    # GitHub 单个 job 硬上限 360 分钟，留出余量
     timeout-minutes: 350
 
     steps:
       - name: Checkout build recipe
         uses: actions/checkout@v4
 
+      # ---------------------------------------------------------------
+      # 磁盘：runner 默认约 14GB 可用，OpenWrt 全量编译（含 toolchain、
+      # build_dir、ccache）很容易冲过这个数——必须先腾地方，否则会在
+      # 编译到一半时报 "No space left on device"。
+      # ---------------------------------------------------------------
       - name: Free disk space
         run: |
           echo "--- before ---"
@@ -50,44 +70,39 @@ jobs:
             liblzo2-dev libzstd-dev libgmp-dev libmpc-dev libmpfr-dev \
             python3-ply python3-yaml ecj fastjar gcc-multilib g++-multilib \
             nano qemu-utils
+          # 少数镜像缺失的可选包，装不上不影响主流程
           sudo apt-get install -y --no-install-recommends \
             upx-ucl antlr3 asciidoc intltool help2man || true
           ccache --version | head -1
 
-      - name: Clone ImmortalWrt source
+      # ---------------------------------------------------------------
+      # 浅克隆指定 tag。--branch 接受 tag 名，会停在 detached HEAD，
+      # 这正是我们要的：每次拿到同一棵树。
+      # ---------------------------------------------------------------
+      - name: Clone ImmortalWrt source (${{ env.SRC_TAG }})
         run: |
-          git clone --depth=1 -b "${SRC_TAG}" https://github.com/immortalwrt/immortalwrt.git openwrt
+          git clone --depth=1 -b "${SRC_TAG}" \
+            https://github.com/immortalwrt/immortalwrt.git openwrt
           cd openwrt
           echo "HEAD = $(git rev-parse HEAD)"
-          git log -1 --oneline
+          git log -1 --format='%H %ci %s'
 
-          echo "=== 版本标识自检 ==="
-          cat version || true
-          cat version.date || true
+          echo "=== 版本标识自检（应与官方发布产物一致）==="
+          echo "version 文件内容: $(cat version)"
+          echo "version.date    : $(cat version.date)"
+          echo "version.mk 默认值:"
+          grep -nE 'VERSION_NUMBER\)?,24\.10\.6|VERSION_REPO\)?,https|VERSION_CODE\)?,r' include/version.mk || true
 
-          echo "=== feeds 锁定情况 ==="
+          echo "=== feeds 锁定情况（tag 上应当是 SHA，而不是分支名）==="
           cat feeds.conf.default
+          if ! grep -q '\^[0-9a-f]\{40\}' feeds.conf.default; then
+            echo "::warning::feeds.conf.default 未锁定到具体 commit，本次构建的包版本可能漂移"
+          fi
 
-      - name: Update Feeds and Setup PassWall 2
-        run: |
-          cd openwrt
-
-          # 1. 基础 feeds 索引更新
-          ./scripts/feeds update -a
-
-          # 2. 升级 Golang 到 23.x
-          rm -rf feeds/packages/lang/golang
-          git clone --depth=1 https://github.com/sbwml/packages_lang_golang -b 23.x feeds/packages/lang/golang
-
-          # 3. 彻底清理旧目录
-          rm -rf package/helloworld package/passwall*
-
-          # 4. 拉取 openwrt_helloworld v5
-          git clone --depth=1 https://github.com/sbwml/openwrt_helloworld.git -b v5 package/helloworld
-
-          # 5. 安装 feeds 并建立依赖符号链接
-          ./scripts/feeds install -a
-
+      # ---------------------------------------------------------------
+      # ccache：第二次及以后的编译能从数小时降到几十分钟。
+      # 首次编译没有命中，属于正常现象。
+      # ---------------------------------------------------------------
       - name: Restore ccache
         uses: actions/cache@v4
         with:
@@ -100,24 +115,45 @@ jobs:
             ccache-nx30pro-${{ env.SRC_TAG }}-
             ccache-nx30pro-
 
+      - name: Update and install feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # ---------------------------------------------------------------
+      # 装载配置并做硬校验。
+      #
+      # 为什么这一步是整个流程里最重要的：
+      #   kconfig 对「拼错的符号」和「不存在的包名」的处理方式是——静默丢弃。
+      #   没有任何报错。于是 CI 全绿，你刷进去却发现没有 passwall2。
+      #   下面这些 grep 就是把静默失败变成构建失败。
+      # ---------------------------------------------------------------
       - name: Load config and verify selections
         run: |
-          echo "==== 载入并清洗配置文件 ===="
-          CONFIG_FILE=$(find "$GITHUB_WORKSPACE" -maxdepth 3 -type f \( -name "nx30pro-nmbm.config" -o -name "*nx30pro*.conf" -o -name ".config" \) ! -path "*/openwrt/*" | head -n 1)
-          if [ -n "$CONFIG_FILE" ] && [ -f "$CONFIG_FILE" ]; then
-            echo "找到目标配置文件: $CONFIG_FILE"
-            # 清洗非法 UTF-8 NBSP 不间断空格及 CRLF 换行
-            sed -e 's/\xc2\xa0/ /g' -e 's/\r$//' "$CONFIG_FILE" > openwrt/.config
-          else
-            echo "::error::未找到 nx30pro-nmbm.config！"
-            exit 1
-          fi
-
           cd openwrt
+
+          # ── passwall2 上游信息：把锁定提交里的真实符号与依赖打印出来 ──
+          # passwall2 的 INCLUDE_* 子选项名没有对锁定 feed 提交逐条核对过，
+          # 这里直接从 Makefile 里读出来，首次编译请对照日志确认拼写。
+          echo "=== passwall2 Makefile（锁定提交）==="
+          PW2_MK=$(find -L feeds -path '*luci-app-passwall2/Makefile' -print -quit 2>/dev/null || true)
+          if [ -n "$PW2_MK" ]; then
+            echo "路径: $PW2_MK"
+            echo "--- 可用的 INCLUDE_* 符号 ---"
+            grep -oE 'INCLUDE_[A-Za-z0-9_]+' "$PW2_MK" | sort -u || true
+            echo "--- LUCI_DEPENDS 片段 ---"
+            grep -nA20 '^LUCI_DEPENDS' "$PW2_MK" | head -40 || true
+          else
+            echo "::warning::feeds 里找不到 luci-app-passwall2/Makefile"
+          fi
+          echo
+
+          cp ../nx30pro-nmbm.config .config
           make defconfig
 
           fail=0
-          chk_on() {
+          chk_on() {   # chk_on  <符号>  <说明>
             if grep -q "^$1=y" .config; then
               echo "  [OK]      $1"
             else
@@ -125,7 +161,7 @@ jobs:
               fail=1
             fi
           }
-          chk_off() {
+          chk_off() {  # chk_off <符号>  <说明>
             if grep -q "^# $1 is not set" .config; then
               echo "  [已关闭]  $1"
             elif grep -q "^$1=y" .config; then
@@ -142,90 +178,123 @@ jobs:
                  "NX30 Pro NMBM 设备未被选中"
           chk_on CONFIG_TARGET_PER_DEVICE_ROOTFS "未按设备裁剪 rootfs，体积会失控"
 
-          echo "=== 2. 代理包与子选项（PassWall 2 + Fake-IP + 分流架构）==="
-          chk_on CONFIG_PACKAGE_luci-app-passwall2 "feeds 里可能没有 luci-app-passwall2"
-
-          chk_core() {
-            local label="$1"
-            shift
-            local found=0
-            for symbol in "$@"; do
-              if grep -q "^${symbol}=y" .config; then
-                found=1
-                echo "  [OK]      $symbol ($label)"
-                break
-              fi
-            done
-            if [ "$found" -eq 0 ]; then
-              echo "  [缺失!!]  $label 核心在 .config 中未开启"
-              fail=1
-            fi
-          }
-
-          chk_core "Sing-Box 核心 (Fake-IP 虚拟池/TUN 必需)" CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_sing-box CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_SingBox CONFIG_PACKAGE_sing-box
-          chk_core "Xray 核心" CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_xray CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_Xray CONFIG_PACKAGE_xray-core
-          chk_core "Hysteria2 客户端" CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_hysteria CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_Hysteria CONFIG_PACKAGE_hysteria
-          chk_core "Shadowsocks-Rust 客户端" CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_shadowsocks-rust CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_Shadowsocks_Rust_Client CONFIG_PACKAGE_shadowsocks-rust-sslocal
-          chk_core "ChinaDNS-NG 分流引擎" CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_chinadns-ng CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_ChinaDNS_NG CONFIG_PACKAGE_chinadns-ng
-          chk_core "规则分流数据 (GeoIP/GeoSite)" CONFIG_PACKAGE_v2ray-geoip CONFIG_PACKAGE_v2ray-geosite CONFIG_PACKAGE_v2ray-geodata CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_geodata CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_v2ray-geodata CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_V2ray_Geodata
-
-          for k in Xray_Plugin V2ray_Plugin NaiveProxy \
-                   Shadowsocks_Rust_Server V2ray_Geoview Shadow_TLS \
-                   tuic_client Simple_Obfs Haproxy; do
+          echo "=== 2. 代理包与子选项（passwall2）==="
+          chk_on CONFIG_PACKAGE_luci-app-passwall2 "feeds 里可能没有该包"
+          chk_on CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_Xray "xray 核心缺失，固件将无法代理，FakeDNS 也无从谈起"
+          chk_on CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_Hysteria "Hysteria2 客户端缺失（包名是 hysteria，装的却是 2.x）"
+          chk_on CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_Shadowsocks_Rust_Client "SS 客户端缺失"
+          chk_on CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_V2ray_Geodata "geoip/geosite 数据缺失，分流规则里的 geosite:/geoip: 标签无数据可用"
+          # geoview 是分流规则展开 geoip/geosite 标签的二进制。INCLUDE 开关名在不同
+          # 提交里叫法不同，所以不断言开关，直接断言 geoview 包本身被选中。
+          chk_on CONFIG_PACKAGE_geoview "geoview 缺失，geosite:/geoip: 分流规则无法展开"
+          # 旧版 passwall 必须关闭：与 passwall2 共存会争用 nftables / dnsmasq 规则
+          chk_off CONFIG_PACKAGE_luci-app-passwall "旧版 passwall 不应存在，会与 passwall2 冲突"
+          # INCLUDE_* 关闭项逐条断言。它们在 aarch64 上大多「默认 y」，
+          # 只要有一条悄悄翻回 y，就会多带无用二进制。
+          # passwall2 里不存在的符号会被标为「不适用」，属正常。
+          for k in SingBox Xray_Plugin V2ray_Plugin NaiveProxy \
+                   Shadowsocks_Rust_Server Shadowsocks_Libev_Client Shadowsocks_Libev_Server \
+                   ShadowsocksR_Libev_Client ShadowsocksR_Libev_Server Trojan_Plus \
+                   Shadow_TLS tuic_client Simple_Obfs Haproxy; do
             chk_off "CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_$k" \
-                    "该组件非必须，开启会增大固件体积"
+                    "该组件默认开启，打开会多带无用二进制"
           done
 
-          echo "  --- 中文界面开关 ---"
+          # FakeDNS 需要 dnsmasq 能把域名解析转发给代理核心；ImmortalWrt 默认
+          # 带 dnsmasq-full。这里只做提示，不阻断。
+          if ! grep -q '^CONFIG_PACKAGE_dnsmasq-full=y' .config; then
+            echo "::warning::未选中 dnsmasq-full，请确认 passwall2 的 DNS 转发/分流是否仍可用"
+          fi
+
+          echo "  --- 中文界面开关（机制见配置文件 LuCI 段注释）---"
+          # 汉化包 luci-i18n-*-zh-cn 是 HIDDEN 的派生包：luci.mk 给它们
+          # HIDDEN:=1 + DEFAULT:=LUCI_LANG_zh_Hans||(ALL&&m)，而
+          # package-metadata.pl 对 hidden 包会清空 prompt，取值交给 default 求值。
+          # 所以真正要断言的是**带 prompt 的总开关** LUCI_LANG_zh_Hans，
+          # 逐包断言作为派生结果核对。
           chk_on CONFIG_LUCI_LANG_zh_Hans "中文界面总开关；关掉后 LuCI 会退回英文"
-          for p in base firewall package-manager argon-config passwall2 ttyd upnp; do
+          for p in base firewall package-manager passwall2 upnp zerotier; do
             chk_on "CONFIG_PACKAGE_luci-i18n-$p-zh-cn" "该应用的汉化包缺失，界面会是英文"
           done
 
-          if [ ! -d package/helloworld/luci-app-passwall2 ] && [ ! -d package/feeds/luci/luci-app-passwall2 ]; then
-            echo "::error::未检测到 luci-app-passwall2 源码目录"
+          if [ ! -d package/feeds/luci/luci-app-passwall2 ]; then
+            echo "::error::package/feeds/luci/luci-app-passwall2 不存在 —— 锁定的 luci feed 提交里没有 passwall2，"
+            echo "          需要改用 Openwrt-Passwall/openwrt-passwall2 作为额外 feed（见 README / 对话说明）"
             fail=1
           fi
 
-          check_src() {
-            if [ -n "$(find -L package/feeds package/helloworld -maxdepth 3 -type d -name "$1" -print -quit 2>/dev/null)" ]; then
+          # ── feeds 源码目录存在性检查 ──────────────────────────────────
+          # 这里有两个必须注意的点，写错了断言会成片误报：
+          #  ① ./scripts/feeds install 建的是**符号链接**（见 scripts/feeds 的
+          #     do_install_src：`ln -sf ../../../$path ./package/feeds/<feed>/`）。
+          #     find 默认**不跟随**符号链接，裸用 -type d 永远匹配不到这些条目，
+          #     会 100% 误报「在 feeds 中缺失」。必须加 -L 跟随。
+          #  ② i18n 包在 feeds 里**没有独立源码目录** —— 它由 luci.mk 的
+          #     LuciTranslation 在宿主应用自己的目录内派生。目录检查只能覆盖
+          #     真正有源码目录的包，汉化包由上面的 chk_on 负责。
+          find_src() {
+            find -L package/feeds -maxdepth 2 -type d -name "$1" -print -quit 2>/dev/null
+          }
+          check_src() {        # 必需：缺失则失败
+            if [ -n "$(find_src "$1")" ]; then
               echo "  [就位]   $1"
             else
-              echo "::error::$1 源码缺失，编译必然中途失败"
+              echo "::error::$1 在 feeds 中缺失，编译必然中途失败"
               fail=1
             fi
           }
+          check_src_soft() {   # 可选：缺失只告警（passwall2 不一定依赖它）
+            if [ -n "$(find_src "$1")" ]; then
+              echo "  [就位]   $1"
+            else
+              echo "::warning::$1 不在 feeds 中（passwall2 可能并不需要它，以编译结果为准）"
+            fi
+          }
 
-          echo "  --- PassWall 2 运行时依赖是否已就位 ---"
-          for p in sing-box xray-core hysteria shadowsocks-rust v2ray-geodata chinadns-ng \
-                   dns2socks ipt2socks microsocks tcping curl; do
+          # 运行时依赖不在 .config 里显式指定，而是靠依赖解析从 packages feed 拉入。
+          # 若 feed 缺包，编译会在两小时后才失败 —— 这里提前做目录存在性检查，
+          # 把它变成几十秒内就暴露的错误。
+          echo "  --- passwall2 运行时依赖是否已在 feeds 中就位 ---"
+          for p in xray-core hysteria shadowsocks-rust v2ray-geodata geoview tcping curl; do
+            check_src "$p"
+          done
+          # 下面这几个是旧 passwall 的依赖，passwall2 是否需要取决于版本，仅告警
+          for p in chinadns-ng dns2socks ipt2socks microsocks; do
+            check_src_soft "$p"
+          done
+
+          echo "=== 2b. ZeroTier 组网（拼写取自锁定 feed commit 的 Makefile）==="
+          # 主包名是 zerotier，界面包名是 luci-app-zerotier。
+          # 注意两个子开关**不带 PACKAGE_ 前缀**（定义在 net/zerotier/Config.in，
+          # 默认就是 n），不显式断言的话日后误开也不会有人发现。
+          chk_on  CONFIG_PACKAGE_zerotier "VPN 主程序缺失，界面会在但没有任何后端"
+          chk_on  CONFIG_PACKAGE_luci-app-zerotier "界面缺失，只能靠命令行操作"
+          chk_off CONFIG_ZEROTIER_ENABLE_DEBUG "调试构建，体积更大且无用途"
+          chk_off CONFIG_ZEROTIER_ENABLE_SELFTEST "自测程序，无用途"
+
+          echo "  --- ZeroTier 源码目录是否已在 feeds 中就位 ---"
+          # luci-i18n-zerotier-zh-cn 刻意不在此列：它没有独立源码目录（原因见上）。
+          for p in zerotier luci-app-zerotier; do
             check_src "$p"
           done
 
-          echo "=== 2b. ZeroTier 组网（已彻底移除）==="
-          chk_off CONFIG_PACKAGE_zerotier "已确认不构建 ZeroTier"
-          chk_off CONFIG_PACKAGE_luci-app-zerotier "已确认不构建 ZeroTier 界面"
-
           echo "=== 3. 内核模块（必须此刻编入：vermagic 改变后无法事后安装）==="
+          # 前三个是透明代理（TProxy）的强制依赖。
+          # 不写也会被依赖解析自动选中，这里显式列出是为了让断言能覆盖到它们。
           for k in kmod-nft-socket kmod-nft-tproxy kmod-nft-nat \
-                   kmod-zram kmod-tcp-bbr kmod-tun \
+                   kmod-zram kmod-nft-fullcone kmod-tcp-bbr kmod-tun \
                    kmod-inet-diag kmod-netlink-diag kmod-wireguard kmod-sched-cake; do
             chk_on "CONFIG_PACKAGE_$k" "该模块将来无法用 opkg 补装"
           done
 
-          # 针对 24.10 内核下的 fullcone 命名做双向兼容断言
-          if grep -q "^CONFIG_PACKAGE_kmod-nft-fullcone=y" .config || grep -q "^CONFIG_PACKAGE_kmod-nft-fullconenat=y" .config; then
-            echo "  [OK]      kmod-nft-fullcone (全锥型 NAT 模块)"
-          else
-            echo "  [缺失!!]  kmod-nft-fullcone 核心在 .config 中未开启"
-            fail=1
-          fi
-
-          echo "=== 4. UPnP 后端与 DNS 劫持依赖 ==="
+          echo "=== 4. UPnP 后端（firewall4 环境必须选 nftables 变体）==="
           chk_on CONFIG_PACKAGE_miniupnpd-nftables "选了 iptables 变体在 firewall4 下不工作"
-          chk_on CONFIG_PACKAGE_dnsmasq-full "dnsmasq-full 缺失，Fake-IP nftset 将失效"
 
           echo "=== 5. 构建开关（buildbot / 调试专用项必须关）==="
+          # KERNEL_DEBUG_INFO 的默认值是 `y if !SMALL_FLASH`（config/Config-kernel.in），
+          # filogic 正落在 !SMALL_FLASH 一侧，所以它默认就是 y —— 与 DEVEL 无关。
+          # TARGET_ALL_PROFILES 的默认值是 `default BUILDBOT`（target-metadata.pl），
+          # 一旦打开就会把 145 个设备一起编。
           for k in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_BUILDBOT \
                    CONFIG_BUILD_LOG CONFIG_JSON_CYCLONEDX_SBOM \
                    CONFIG_KERNEL_DEBUG_INFO CONFIG_KERNEL_DEBUG_INFO_BTF \
@@ -234,19 +303,37 @@ jobs:
             chk_off "$k" "buildbot / 调试专用，打开会大幅拉长编译时间或撑爆磁盘"
           done
           chk_on CONFIG_CCACHE "没开缓存，第二次编译仍然要数小时"
+          # CCACHE 与 BUILD_LOG 的 prompt 都挂在 DEVEL 上，所以 DEVEL 必须开 ——
+          # 否则 make defconfig 会把 CONFIG_CCACHE=y 当作无 prompt 符号丢掉。
           chk_on CONFIG_DEVEL "关掉后 CCACHE 的 prompt 消失，缓存开关会被静默丢弃"
 
           echo "=== 5b. 其余显式包与结构性符号 ==="
-          for p in luci luci-compat luci-theme-argon luci-app-argon-config \
-                   luci-app-ttyd luci-app-upnp openssh-sftp-server htop zram-swap; do
+          # kconfig 对「拼错 / 不存在的符号」是静默丢弃，不报错。上面已经覆盖了
+          # 关键组件，这里把剩下的显式包也一并断言，避免出现「CI 全绿但刷完少东西」。
+          for p in luci luci-compat luci-theme-argon \
+                   luci-app-upnp openssh-sftp-server zram-swap; do
             chk_on "CONFIG_PACKAGE_$p" "该包静默未被选中，刷完不会有"
           done
+          # 本次移除的包：断言它们确实没进固件（可能被别的包依赖拉回来）
+          for p in luci-app-ttyd luci-app-argon-config htop; do
+            chk_off "CONFIG_PACKAGE_$p" "已决定移除，但被依赖或默认值拉回来了"
+          done
+          # IMAGEOPT 必须先于 VERSIONOPT：VERSIONOPT 的 prompt 是
+          #   bool "Version configuration options" if IMAGEOPT
+          # （package/base-files/image-config.in L153-154），IMAGEOPT 默认 n。
+          # IMAGEOPT 若未打开，VERSIONOPT 就没有 prompt，整组 VERSION_*
+          # 子项（含 VERSION_NUMBER / VERSION_REPO）会被 make defconfig 丢弃。
           for k in CONFIG_TARGET_mediatek CONFIG_TARGET_mediatek_filogic \
                    CONFIG_TARGET_MULTI_PROFILE CONFIG_IMAGEOPT \
                    CONFIG_VERSIONOPT CONFIG_VERSION_FILENAMES; do
             chk_on "$k" "结构性符号，失效会导致目标/版本信息不对"
           done
-
+          # 这里刻意不断言 CONFIG_STRIP_KERNEL_EXPORTS：
+          # 它的 prompt 挂着 `depends on BROKEN`（config/Config-build.in L236-238），
+          # 而 BROKEN 默认 n ⇒ 该符号无 prompt ⇒ 永远不写入 .config。
+          #
+          # 真正要盯的是「版本号是否真的落了地」—— 这比断言符号本身更可靠，
+          # 因为即使符号被丢弃，构建也不会报错，只会在产物名/opkg 源上悄悄走偏。
           if ! grep -q '^CONFIG_VERSION_NUMBER="24.10.6-nx30pro"' .config; then
             echo "::error::自定义版本号未生效 —— VERSIONOPT 很可能被丢弃了（检查 IMAGEOPT 是否打开）"
             fail=1
@@ -257,8 +344,15 @@ jobs:
           echo
           echo "=== 6. 版本与 opkg 源（决定刷完后 opkg update 能否成功）==="
           grep -E '^CONFIG_VERSION_(NUMBER|REPO)=' .config || true
-          if ! grep -q '^CONFIG_VERSION_REPO="[https://downloads.immortalwrt.org/releases/24.10.6](https://downloads.immortalwrt.org/releases/24.10.6)"' .config; then
+          # VERSION_REPO 决定 /etc/opkg/distfeeds.conf 里的域名前缀
+          # （include/feeds.mk：src/gz %d_core %U/...，%U 即 VERSION_REPO）。
+          # 它丢失时 version.mk 会回落到 tag 默认值 —— 恰好也是同一个官方地址，
+          # 所以「源不可用」不会发生，但「自定义版本号失效」会被掩盖。
+          # 这里改成硬断言：一旦它不等于官方 24.10.6 地址，直接失败。
+          if ! grep -q '^CONFIG_VERSION_REPO="https://downloads.immortalwrt.org/releases/24.10.6"' .config; then
             echo "::error::VERSION_REPO 未生效或指向意外地址，刷完后 opkg 源可能不可用"
+            echo "          期望: CONFIG_VERSION_REPO=\"https://downloads.immortalwrt.org/releases/24.10.6\""
+            echo "          实际: $(grep '^CONFIG_VERSION_REPO=' .config || echo '(该行不存在)')"
             fail=1
           else
             echo "  [OK]      CONFIG_VERSION_REPO 指向官方 24.10.6 发布地址"
@@ -276,6 +370,18 @@ jobs:
           cd openwrt
           make -j$(nproc) download || make -j1 download V=s
 
+      # ---------------------------------------------------------------
+      # 编译。诊断逻辑**并入本步骤**，不新开一步 —— 新开一步会让后面所有
+      # 步骤的页面编号 +1，而文档与沟通都按页面编号引用。
+      #
+      # 为什么必须自己发 ::error::：
+      # 公开仓库的 job 日志匿名读不到（API 403 "Must have admin rights"），
+      # 所以「要人去看日志才知道发生了什么」的输出，等于没有输出。
+      # ::error:: 会变成 check-run annotation，**匿名可读**。
+      #
+      # 全量输出也不该上屏：编译日志几百 MB，上屏只会把界面刷爆。
+      # ⇒ 全量落盘到 $RUNNER_TEMP（不进 artifact），失败时只把**错误行 + 尾部**推出去。
+      # ---------------------------------------------------------------
       - name: Build firmware
         id: build
         run: |
@@ -283,96 +389,281 @@ jobs:
           mkdir -p "$RUNNER_TEMP/blog"
           LOG="$RUNNER_TEMP/blog/build.log"
           rc=0
-
-          echo "==== 开始多线程并行编译 ===="
+          # 并行阶段：全量落盘、不上屏（几百 MB，上屏只会把界面刷爆）
           if ! make -j$(nproc) > "$LOG" 2>&1; then
-            echo "::warning::多线程并行构建遇到错误，开始启用单线程详细模式 (V=s) 精确重试并定位..."
-            make -j1 V=s 2>&1 | tee -a "$LOG" || rc=1
+            echo "并行编译失败，改用单线程带详细日志重跑（其余包已编完，只重试失败处）"
+            make -j1 V=s >> "$LOG" 2>&1 || rc=1
           fi
+          if [ "$rc" = "0" ]; then exit 0; fi
 
-          if [ "$rc" = "0" ]; then
-            echo "==== 固件编译顺利完成 ===="
-            exit 0
-          fi
-
+          # ---------- 失败：先把原因推进公开通道，再以失败退出 ----------
+          # 转义顺序：% 必须最先转，否则行内原有的 % 会被当成转义引导符
           esc() { sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN{ORS=""} {print $0 "%0A"}'; }
 
           if [ ! -f "$LOG" ]; then
-            echo "::error title=编译失败::未找到编译日志 $LOG —— 失败可能发生在 make 命令执行前"
+            echo "::error title=编译失败::未找到编译日志 $LOG —— 失败可能发生在 make 之前"
             exit 1
           fi
 
-          echo "编译日志总计 $(wc -l < "$LOG") 行 / $(du -h "$LOG" | cut -f1)"
-
-          ERR_REGEX='make(\[[0-9]+\])?: \*\*\*|Error [0-9]+$|error:|fatal error:|undefined reference|No rule to make target|failed to build|build failed|panic:|syntax error|collect2: error:'
-          ERRS=$(grep -nE "$ERR_REGEX" "$LOG" | tail -n 80)
-          TAILB=$(tail -n 80 "$LOG")
+          echo "编译日志共 $(wc -l < "$LOG") 行 / $(du -h "$LOG" | cut -f1)"
+          ERRS=$(grep -nE 'make(\[[0-9]+\])?: \*\*\*|Error [0-9]+$|error:|fatal error:|undefined reference|No rule to make target|failed to build' "$LOG" | tail -n 60)
+          TAILB=$(tail -n 60 "$LOG")
 
           {
-            echo "### ❌ 固件编译失败诊断报告（Run #${{ github.run_number }}）"
+            echo "### 编译失败诊断（run ${{ github.run_number }}）"
             echo
-            echo "- **日志总量**：$(wc -l < "$LOG") 行 ($(du -h "$LOG" | cut -f1))"
+            echo "编译日志共 $(wc -l < "$LOG") 行。"
             echo
-            echo '#### ① 捕获的致命错误（最多显示 80 条）'
-            echo '```text'
-            if [ -n "$ERRS" ]; then printf '%s\n' "$ERRS"; else echo "(未匹配到常见特征行，请参阅下方日志尾部内容)"; fi
+            echo '**① 典型错误行（grep，最多 60 条）**'
+            echo '```'
+            if [ -n "$ERRS" ]; then printf '%s\n' "$ERRS"; else echo "(没有匹配到典型错误行，看下面日志尾部)"; fi
             echo '```'
             echo
-            echo '#### ② 编译日志尾部 80 行'
-            echo '```text'
+            echo '**② 日志尾部 60 行**'
+            echo '```'
             printf '%s\n' "$TAILB"
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY:-/dev/null}" || true
 
-          echo "---- 致命错误汇总 ----"
-          if [ -n "$ERRS" ]; then printf '%s\n' "$ERRS"; else echo "(无直接特征匹配)"; fi
-          echo "---- 日志最后 80 行 ----"
+          echo "---- 典型错误行 ----"
+          if [ -n "$ERRS" ]; then printf '%s\n' "$ERRS"; else echo "(无匹配)"; fi
+          echo "---- 日志尾部 ----"
           printf '%s\n' "$TAILB"
 
           if [ -n "$ERRS" ]; then
-            echo "::error title=编译错误特征匹配::$(printf '\%s\n' "$ERRS" | head -c 20000 | esc)"
+            echo "::error title=编译错误行（最多 60 条）::$(printf '%s\n' "$ERRS" | head -c 20000 | esc)"
           fi
-          echo "::error title=构建日志尾部输出::$(printf '\%s\n' "$TAILB" | head -c 20000 | esc)"
+          echo "::error title=编译日志尾部 60 行::$(printf '%s\n' "$TAILB" | head -c 20000 | esc)"
           exit 1
 
-      - name: Organize output firmware
-        if: always() && steps.build.outcome == 'success'
+      # ---------------------------------------------------------------
+      # 校验与记录。发现异常就 exit 1 让运行变红 —— 这是有意的。
+      #
+      # 但「变红」只应该是一个信号，不应该连累产物交付。为此这里守两条：
+      #   1) 下面的 Upload 步骤带 if: always() && steps.build.outcome == 'success'
+      #      —— 构建成功过就一定要把产物存下来，不看本步骤的结论；
+      #   2) 本步骤内部把「清单落盘」放在所有断言之前 —— 断言一旦 exit 1，
+      #      生成在它后面的文件就永远不会被创建，会让 artifact 少一份清单。
+      # ---------------------------------------------------------------
+      - name: Verify artifacts and report sizes
+        id: verify
         run: |
           cd openwrt/bin/targets/mediatek/filogic
-          echo "==== 产物目录完整清单 ===="
-          ls -lh
-          
-          # 创建统一交付目录，精准抓取所有二进制固件和清单
-          mkdir -p "$GITHUB_WORKSPACE/firmware_out"
-          cp -f *bin* "$GITHUB_WORKSPACE/firmware_out/" 2>/dev/null || true
-          cp -f *manifest* "$GITHUB_WORKSPACE/firmware_out/" 2>/dev/null || true
-          cp -f sha256sums "$GITHUB_WORKSPACE/firmware_out/" 2>/dev/null || true
-          cp -f config.buildinfo "$GITHUB_WORKSPACE/firmware_out/" 2>/dev/null || true
-          cp -f profiles.json "$GITHUB_WORKSPACE/firmware_out/" 2>/dev/null || true
-          
-          echo "==== 准备打包的文件列表 ===="
-          ls -lh "$GITHUB_WORKSPACE/firmware_out"
+          echo "=== 目标镜像 ==="
+          ls -lh *h3c_magic-nx30-pro-nmbm* || true
+          echo
+          echo "=== rootfs 与内核 ==="
+          # 本机型的 squashfs 镜像把内核与 rootfs 打进同一个 bin，不会生成独立的
+          # rootfs 文件，所以这里通常只匹配到 initramfs-kernel.bin —— 属正常，
+          # 不是缺产物。
+          ls -lh *rootfs* *kernel* 2>/dev/null || true
+          echo
+          echo "=== 本固件的内核 vermagic ==="
+          # 回到源码树根。这里必须用绝对路径，不能靠 cd ../../.. 数层级：
+          # 从 bin/targets/mediatek/filogic 往上数三级只到 bin/，下面所有
+          # bin/... 与 build_dir/... 相对路径会整片落空，而且因为 find 的管道
+          # 末位是 head（返回 0），set -e 不会拦，失败是静默的。
+          cd "$GITHUB_WORKSPACE/openwrt"
+          # 路径基准自检：这三处任一缺失，后面的 find 一律返回空，只会得到
+          # 一堆看不懂的「未编出」误报。先在这里一次性说清楚。
+          for d in build_dir bin/packages bin/targets/mediatek/filogic; do
+            [ -d "$d" ] || { echo "::error::工作目录基准错误：$d 不存在（当前 $(pwd)）"; exit 1; }
+          done
+          [ -f .config ] || { echo "::error::.config 不存在（当前 $(pwd)）"; exit 1; }
+          BIN=bin/targets/mediatek/filogic
 
-      - name: Upload firmware to Artifacts
+          # --- 清单先落盘：必须在下面任何断言之前 ---
+          # 每条都自带兜底。这一步失败也不该让整步红掉 —— 它只是"记录"，
+          # 真正的判断留给下面的断言。
+          find $BIN -name 'kmod-*.ipk' -printf '%f\n' 2>/dev/null | sort > kmods-built.txt || true
+          cp kmods-built.txt $BIN/kmods-built.txt 2>/dev/null || echo "::warning::未能把 kmods-built.txt 复制进产物目录"
+          cp .config $BIN/config.custom 2>/dev/null || echo "::warning::未能把 .config 复制进产物目录"
+          echo "内核模块清单已落盘：kmods-built.txt（$(wc -l < kmods-built.txt 2>/dev/null || echo 0) 行）"
+          echo
+
+          VF=$(find build_dir -name .vermagic -path '*linux-mediatek_filogic*' 2>/dev/null | head -1 || true)
+          if [ -n "$VF" ]; then
+            echo "vermagic = $(cat "$VF")"
+            echo "对照：官方 24.10.6 为 ${UPSTREAM_VERMAGIC}"
+            echo "两者不同是预期的（内核配置不同），代价是官方 kmods 无法事后 opkg 安装。"
+          fi
+          echo
+          echo "=== 本固件自带的内核模块（这就是你拥有的全部 kmod）==="
+          # 清单本体已在上面落盘，这里只负责显示。
+          # 不要让 tee 直接接 head：head 读满 N 行就关管道，tee 收到 EPIPE
+          # 会立刻退出，落盘的清单会被截断 —— 所以是「先重定向落盘，再 head 显示」。
+          head -60 kmods-built.txt || true
+          echo "(共 $(wc -l < kmods-built.txt 2>/dev/null || echo 0) 个；完整清单已存 kmods-built.txt 并随产物上传)"
+          echo
+          # 这一节是「实证核对」：不看 .config 里选了什么，只看编译产物里到底有没有。
+          # .config 断言能防拼写错误，但防不住「依赖解析没把包拉进来」这种情况。
+          echo "=== 代理核心是否真的编出来了（实证，而非只看 .config）==="
+          for p in xray-core hysteria shadowsocks-rust-sslocal geoview; do
+            f=$(find bin/packages -name "${p}_*.ipk" -print -quit 2>/dev/null || true)
+            if [ -n "$f" ]; then
+              echo "  [已编出] $(basename "$f")"
+            else
+              echo "::error::$p 未出现在 bin/packages —— 固件将不含该组件"
+              exit 1
+            fi
+          done
+          # ipk 的载荷 =「tar.gz 里再套一层 data.tar.gz」，并不是 Debian 的 ar 归档。
+          # 见 scripts/ipkg-build 收尾那行：
+          #   $TAR ... ./debian-binary ./data.tar.gz ./control.tar.gz | gzip -n - > pkg.ipk
+          # 实测文件头是 1f 8b（gzip 魔数），不是 ar 的 "!<arch>"。
+          # 所以必须两层 tar；用 ar 只会得到空列表。
+          # 结尾的 || true：解包失败时管道返回非零，而 var=$(...) 处在 set -e
+          # 之下会直接在赋值处退出，连后面的 ::warning:: 诊断都来不及打印。
+          ipk_payload() { tar -xzOf "$1" ./data.tar.gz 2>/dev/null | tar -tzf - 2>/dev/null || true; }
+
+          # passwall2 界面包：必须真的编出来，并含 init 脚本与主控脚本。
+          # 缺 init.d/passwall2 则服务无法启动；缺 app.sh 则启动后什么都不会做。
+          # 注意 find 的通配 'luci-app-passwall2_*' 不会误匹配旧版 luci-app-passwall_*。
+          PWS=$(find bin/packages -name 'luci-app-passwall2_*.ipk' -print -quit 2>/dev/null || true)
+          if [ -n "$PWS" ]; then
+            echo "  [已编出] $(basename "$PWS")"
+            PWS_PAYLOAD=$(ipk_payload "$PWS")
+            if [ -z "$PWS_PAYLOAD" ]; then
+              echo "::warning::读不出 $(basename "$PWS") 的载荷（解包异常），跳过 passwall2 载荷校验"
+            else
+              for need in etc/init.d/passwall2 usr/share/passwall2/app.sh; do
+                if printf '%s\n' "$PWS_PAYLOAD" | grep -q "$need"; then
+                  echo "  [已确认] luci-app-passwall2 含 $need"
+                else
+                  echo "::error::luci-app-passwall2 内缺少 $need，服务将无法工作"
+                  exit 1
+                fi
+              done
+              # Hysteria2 的配置生成逻辑在哪个文件里随版本而异，这里只做软提示
+              if ! printf '%s\n' "$PWS_PAYLOAD" | grep -qi 'hysteria'; then
+                echo "::warning::luci-app-passwall2 载荷里没有 hysteria 相关文件，请到 LuCI 确认是否能添加 Hysteria2 节点"
+              fi
+            fi
+          else
+            echo "::error::bin/packages 里没有 luci-app-passwall2_*.ipk —— passwall2 界面没编出来"
+            exit 1
+          fi
+          # ZeroTier：主程序与界面都必须真的编出来。
+          # 额外核对包载荷，其中最要紧的是 zerotier-fw4 ——
+          # 它是往 fw4（nftables）里注入规则的脚本，缺了它的现象是
+          # 「网络已加入、Peers 也显示，但双方互相 ping 不通」，
+          # 而 UCI 里的 fw_allow_* 开关不会报任何错。
+          for p in zerotier luci-app-zerotier; do
+            f=$(find bin/packages -name "${p}_*.ipk" -print -quit 2>/dev/null || true)
+            if [ -n "$f" ]; then
+              echo "  [已编出] $(basename "$f")"
+            else
+              echo "::error::$p 未出现在 bin/packages —— 固件将不含 ZeroTier"
+              exit 1
+            fi
+          done
+          ZTP=$(find bin/packages -name 'zerotier_*.ipk' -print -quit 2>/dev/null || true)
+          if [ -n "$ZTP" ]; then
+            ZTPAYLOAD=$(ipk_payload "$ZTP")
+            if [ -z "$ZTPAYLOAD" ]; then
+              echo "::warning::读不出 $(basename "$ZTP") 的载荷（解包异常），跳过 zerotier 载荷校验"
+            else
+              for need in usr/bin/zerotier-one usr/bin/zerotier-fw4 etc/init.d/zerotier etc/config/zerotier; do
+                if printf '%s\n' "$ZTPAYLOAD" | grep -q "$need"; then
+                  echo "  [已确认] zerotier 含 $need"
+                else
+                  echo "::error::zerotier 内缺少 $need（缺失会导致 ZeroTier 起不来或防火墙规则静默失效）"
+                  exit 1
+                fi
+              done
+            fi
+          fi
+          # 数据与辅助组件：缺了只影响对应功能，故只告警
+          for p in v2ray-geoip v2ray-geosite ca-bundle tcping chinadns-ng dns2socks ipt2socks microsocks; do
+            f=$(find bin/packages -name "${p}_*.ipk" -print -quit 2>/dev/null || true)
+            if [ -n "$f" ]; then
+              echo "  [已编出] $(basename "$f")"
+            else
+              echo "::warning::$p 未找到（chinadns-ng / dns2socks / ipt2socks / microsocks 是否需要取决于 passwall2 版本）"
+            fi
+          done
+          # 确认旧版 passwall 没有混进来
+          if find bin/packages -name 'luci-app-passwall_*.ipk' -print -quit 2>/dev/null | grep -q .; then
+            echo "::warning::bin/packages 里出现了旧版 luci-app-passwall，可能与 passwall2 冲突"
+          fi
+          # TProxy 的三个内核模块缺任何一个，透明代理直接不工作
+          for p in kmod-nft-socket kmod-nft-tproxy kmod-nft-nat; do
+            f=$(find bin/targets/mediatek/filogic -name "${p}_*.ipk" -print -quit 2>/dev/null || true)
+            if [ -n "$f" ]; then
+              echo "  [已编出] $(basename "$f")"
+            else
+              echo "::error::$p 缺失，TProxy 透明代理无法工作"
+              exit 1
+            fi
+          done
+          echo
+          echo "=== 空间账 ==="
+          SYS=$(ls -1 $BIN/*h3c_magic-nx30-pro-nmbm-squashfs-sysupgrade.bin 2>/dev/null | head -1 || true)
+          if [ -n "$SYS" ]; then
+            SZ=$(stat -c %s "$SYS")
+            echo "sysupgrade.bin = $((SZ/1024)) KB"
+            # ubi 分区 64MiB (0x4000000)。镜像写进去后，剩余空间自动成为 rootfs_data（overlay）
+            HEAD=$(( 67108864 - SZ ))
+            echo "ubi 分区 65536 KB，扣除镜像后余约 $((HEAD/1024)) KB 给 overlay"
+            if [ "$HEAD" -le 0 ]; then
+              echo "::error::镜像超过 ubi 分区容量"
+              exit 1
+            fi
+          fi
+          # .config 与自带 kmod 清单已在上面落盘进产物目录，便于复现与日后对照
+          echo
+          echo "=== 产物目录总占用 ==="
+          du -sh $BIN || true
+
+      # ---------------------------------------------------------------
+      # 产物落袋。
+      #   always()                      —— 上一步（自检）红了也照跑
+      #   && steps.build.outcome == 'success' —— 但构建本身必须成功过
+      # 少了后半句，构建真失败时也会去跑，只会撞上 if-no-files-found: error
+      # 多报一次错；少了前半句，自检脚本的一个笔误就能让 4 小时的产物打水漂。
+      #
+      # 注意：一旦在 if 里写了状态函数（always/success/failure/cancelled），
+      # 步骤默认带的那个隐式 success() 就失效了，条件完全以这行为准。
+      # ---------------------------------------------------------------
+      - name: Upload firmware
         if: always() && steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-24.10.6-nx30pro-passwall2-${{ github.run_number }}
-          path: ${{ github.workspace }}/firmware_out/
+          name: immortalwrt-24.10.6-nx30pro-nmbm-${{ github.run_number }}
+          path: |
+            openwrt/bin/targets/mediatek/filogic/*h3c_magic-nx30-pro-nmbm*
+            openwrt/bin/targets/mediatek/filogic/sha256sums
+            openwrt/bin/targets/mediatek/filogic/profiles.json
+            openwrt/bin/targets/mediatek/filogic/config.custom
+            openwrt/bin/targets/mediatek/filogic/kmods-built.txt
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish to GitHub Releases
-        if: always() && steps.build.outcome == 'success' && github.event_name != 'pull_request'
+      # 可选：同时发一个 Release，下载更方便（artifact 需要登录 GitHub）。
+      # 不想要可以整段删掉，并把上面的 permissions 一并删掉。
+      #
+      #   steps.build.outcome  == 'success' —— 构建成功过
+      #   steps.verify.outcome == 'success' —— 自检全过（这是 Release 的质量含义）
+      # 但**刻意不看 Upload 的结论**。Upload 与 Release 是两条交付路径，
+      # 应当互为冗余而不是串行。自检红掉时「发 artifact、不发 Release」——
+      # artifact 是存底，Release 是对外的承诺，两者语义不同。
+      - name: Publish release
+        if: always() && steps.build.outcome == 'success' && steps.verify.outcome == 'success' && github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          name: NX30 Pro NMBM PassWall 2 Build #${{ github.run_number }}
+          name: NX30 Pro NMBM build ${{ github.run_number }}
           body: |
-            ### ImmortalWrt 24.10.6 for H3C Magic NX30 Pro (NMBM)
-            - **内置核心**：PassWall 2（原生支持 Fake-IP、Sing-Box DNS 虚拟 IP 池、Xray、Hysteria2、SS-Rust、ChinaDNS-NG 与规则分流）
-            - **网络加速**：MediaTek 硬件 NAT 加速 (HNAT) + 全锥型 NAT (nft_fullcone) + BBR
-            - **移除项**：彻底剔除 ZeroTier 及其依赖库
-            - **刷机说明**：进入 U-Boot Failsafe 界面（`192.168.1.1`），上传 `*-factory.bin` 刷入。
+            基于 ImmortalWrt ${{ env.SRC_TAG }} 编译的 H3C Magic NX30 Pro（NMBM 布局）固件。
+
+            内置：PassWall2（Xray + Hysteria2 + SS-Rust + geo 数据 + geoview，支持 FakeDNS 与分流规则）、ZeroTier、UPnP、zram-swap。
+
+            刷写方式：进 U-Boot failsafe 界面（`http://192.168.1.1`），上传
+            `*-nmbm-squashfs-factory.bin`。不要刷 `-bl31-uboot.fip` 与 `-preloader.bin`。
+
+            注意：本固件的内核 vermagic 与官方发布版不同，**无法用 opkg 补装内核模块**；
+            用户态包（LuCI 插件、代理核心等）可以正常安装。
           prerelease: true
-          files: ${{ github.workspace }}/firmware_out/*
+          files: |
+            openwrt/bin/targets/mediatek/filogic/*h3c_magic-nx30-pro-nmbm*
+            openwrt/bin/targets/mediatek/filogic/kmods-built.txt
