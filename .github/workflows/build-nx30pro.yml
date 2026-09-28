@@ -204,10 +204,15 @@ jobs:
 
           echo "=== 2. 代理包与子选项（passwall2）==="
           chk_on CONFIG_PACKAGE_luci-app-passwall2 "feeds 里可能没有该包"
-          chk_on CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_Xray "xray 核心缺失，固件将无法代理，FakeDNS 也无从谈起"
-          chk_on CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_Hysteria "Hysteria2 客户端缺失（包名是 hysteria，装的却是 2.x）"
-          chk_on CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_Shadowsocks_Rust_Client "SS 客户端缺失"
-          chk_on CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_V2ray_Geodata "geoip/geosite 数据缺失，分流规则里的 geosite:/geoip: 标签无数据可用"
+          echo "  --- .config 中与 passwall2 相关的全部行（供核对开关名）---"
+          grep -n 'passwall2' .config || true
+          # 当前 passwall2 版本没有 INCLUDE_Xray / INCLUDE_Hysteria / INCLUDE_V2ray_Geodata
+          # 开关（实测被丢弃），所以不再断言开关，直接断言实际的包。
+          chk_on CONFIG_PACKAGE_xray-core "xray 核心缺失，固件将无法代理，FakeDNS 也无从谈起"
+          chk_on CONFIG_PACKAGE_hysteria "Hysteria2 客户端缺失（包名是 hysteria，装的却是 2.x）"
+          chk_on CONFIG_PACKAGE_shadowsocks-rust-sslocal "SS 客户端缺失"
+          chk_on CONFIG_PACKAGE_v2ray-geoip "geoip 数据缺失，分流规则里的 geoip: 标签无数据可用"
+          chk_on CONFIG_PACKAGE_v2ray-geosite "geosite 数据缺失，分流规则里的 geosite: 标签无数据可用"
           # geoview 是分流规则展开 geoip/geosite 标签的二进制。INCLUDE 开关名在不同
           # 提交里叫法不同，所以不断言开关，直接断言 geoview 包本身被选中。
           chk_on CONFIG_PACKAGE_geoview "geoview 缺失，geosite:/geoip: 分流规则无法展开"
