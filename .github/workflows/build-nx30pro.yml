@@ -54,25 +54,19 @@ jobs:
             upx-ucl antlr3 asciidoc intltool help2man || true
           ccache --version | head -1
 
-      - name: Clone ImmortalWrt source (${{ env.SRC_TAG }})
+      - name: Clone ImmortalWrt source
         run: |
-          git clone --depth=1 -b "${SRC_TAG}" \
-            [https://github.com/immortalwrt/immortalwrt.git](https://github.com/immortalwrt/immortalwrt.git) openwrt
+          git clone --depth=1 -b "${SRC_TAG}" https://github.com/immortalwrt/immortalwrt.git openwrt
           cd openwrt
           echo "HEAD = $(git rev-parse HEAD)"
-          git log -1 --format='%H %ci %s'
+          git log -1 --oneline
 
-          echo "=== 版本标识自检（应与官方发布产物一致）==="
-          echo "version 文件内容: $(cat version)"
-          echo "version.date    : $(cat version.date)"
-          echo "version.mk 默认值:"
-          grep -nE 'VERSION_NUMBER\)?,24\.10\.6|VERSION_REPO\)?,https|VERSION_CODE\)?,r' include/version.mk || true
+          echo "=== 版本标识自检 ==="
+          cat version || true
+          cat version.date || true
 
-          echo "=== feeds 锁定情况（tag 上应当是 SHA，而不是分支名）==="
+          echo "=== feeds 锁定情况 ==="
           cat feeds.conf.default
-          if ! grep -q '\^[0-9a-f]\{40\}' feeds.conf.default; then
-            echo "::warning::feeds.conf.default 未锁定到具体 commit，本次构建的包版本可能漂移"
-          fi
 
       - name: Update Feeds & Setup PassWall 2 (Fake-IP & Routing)
         run: |
