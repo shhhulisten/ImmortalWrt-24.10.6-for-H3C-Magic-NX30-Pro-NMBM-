@@ -326,3 +326,31 @@ jobs:
             echo
             echo '#### ② 编译日志尾部 80 行'
             echo '```text'
+      - name: Organize & Upload firmware to Artifacts
+        if: always() && steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-24.10.6-nx30pro-passwall2-${{ github.run_number }}
+          path: |
+            openwrt/bin/targets/mediatek/filogic/*nx30-pro*
+            openwrt/bin/targets/mediatek/filogic/sha256sums
+            openwrt/bin/targets/mediatek/filogic/config.buildinfo
+            openwrt/bin/targets/mediatek/filogic/profiles.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish to GitHub Releases
+        if: always() && steps.build.outcome == 'success' && github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: NX30 Pro NMBM PassWall 2 Build #${{ github.run_number }}
+          body: |
+            ### ImmortalWrt 24.10.6 for H3C Magic NX30 Pro (NMBM)
+            - **内置核心**：PassWall 2（原生支持 Fake-IP、Sing-Box DNS 虚拟 IP 池、Xray、Hysteria2、SS-Rust、ChinaDNS-NG 与规则分流）
+            - **网络加速**：MediaTek 硬件 NAT 加速 (HNAT) + 全锥型 NAT (nft_fullcone) + BBR
+            - **移除项**：彻底剔除 ZeroTier 及其依赖库
+            - **刷机说明**：进入 U-Boot Failsafe 界面（`192.168.1.1`），上传 `*-factory.bin` 刷入。
+          prerelease: true
+          files: |
+            openwrt/bin/targets/mediatek/filogic/*nx30-pro*
