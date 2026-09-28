@@ -110,14 +110,67 @@ jobs:
           rm -rf feeds/packages/lang/golang
           git clone --depth=1 https://github.com/sbwml/packages_lang_golang -b 23.x feeds/packages/lang/golang
 
-          # 3. 清理已有的 passwall / helloworld 相关目录
+          # 3. 彻底清理旧目录，避免冲突
           rm -rf package/helloworld package/passwall*
 
-          # 4. 仅克隆 sbwml 的 openwrt_helloworld（自带 passwall2 及全部二进制核心源码）
+          # 4. 仅拉取 openwrt_helloworld v5（自带 luci-app-passwall2 与全套核心源码，无需额外拉取 passwall-luci）
           git clone --depth=1 https://github.com/sbwml/openwrt_helloworld.git -b v5 package/helloworld
 
           # 5. 安装 feeds 并建立依赖符号链接
           ./scripts/feeds install -a
+
+      - name: Load verified NX30 Pro config
+        run: |
+          cd openwrt
+          cp -f ../configs/nx30pro-nmbm.config .config
+          make defconfig
+
+      - name: Check config
+        run: |
+          cd openwrt
+          echo "=== 校验 PassWall 2 与 Fake-IP 核心就绪状态 ==="
+
+          # 检查函数：兼容新版 Makefile 的大小写与连字符命名
+          chk_core() {
+            local label="$1"
+            shift
+            local found=0
+            for symbol in "$@"; do
+              if grep -q "^${symbol}=y" .config; then
+                found=1
+                echo "  [OK]      $symbol ($label)"
+                break
+              fi
+            done
+            if [ "$found" -eq 0 ]; then
+              echo "  [缺失!!]  $1 核心在 .config 中未开启"
+              fail=1
+            fi
+          }
+
+          chk_core "PassWall 2 主包" CONFIG_PACKAGE_luci-app-passwall2
+          chk_core "Sing-Box 核心 (Fake-IP 必需)" CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_sing-box CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_SingBox CONFIG_PACKAGE_sing-box
+          chk_core "Xray 核心" CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_xray CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_Xray CONFIG_PACKAGE_xray-core
+          chk_core "Hysteria 客户端" CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_hysteria CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_Hysteria CONFIG_PACKAGE_hysteria
+          chk_core "Shadowsocks-Rust 客户端" CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_shadowsocks-rust CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_Shadowsocks_Rust_Client CONFIG_PACKAGE_shadowsocks-rust-sslocal
+          chk_core "规则分流数据 (GeoIP/GeoSite)" CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_geodata CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_v2ray-geodata CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_V2ray_Geodata CONFIG_PACKAGE_v2ray-geodata
+          chk_core "ChinaDNS-NG 分流引擎" CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_chinadns-ng CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_ChinaDNS_NG CONFIG_PACKAGE_chinadns-ng
+
+          echo "  --- PassWall 2 源码与核心目录就位验证 ---"
+          for p in sing-box xray-core hysteria shadowsocks-rust v2ray-geodata chinadns-ng; do
+            if [ -n "$(find -L package/feeds package/helloworld -maxdepth 3 -type d -name "$p" -print -quit 2>/dev/null)" ]; then
+              echo "  [就位]   $p"
+            else
+              echo "::error::$p 源码目录缺失"
+              fail=1
+            fi
+          done
+
+          if [ "$fail" = "1" ]; then
+            echo "::error::配置自检未通过，请检查上述缺失项"
+            exit 1
+          fi
+          echo "==== 配置自检全部通过，准备编译 ===="
       # ---------------------------------------------------------------
       # ccache：第二次及以后的编译能从数小时降到几十分钟。
       # 首次编译没有命中，属于正常现象。
