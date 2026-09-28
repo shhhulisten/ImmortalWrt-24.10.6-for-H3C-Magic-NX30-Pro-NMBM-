@@ -57,7 +57,7 @@ jobs:
       - name: Clone ImmortalWrt source (${{ env.SRC_TAG }})
         run: |
           git clone --depth=1 -b "${SRC_TAG}" \
-            https://github.com/immortalwrt/immortalwrt.git openwrt
+            [https://github.com/immortalwrt/immortalwrt.git](https://github.com/immortalwrt/immortalwrt.git) openwrt
           cd openwrt
           echo "HEAD = $(git rev-parse HEAD)"
           git log -1 --format='%H %ci %s'
@@ -83,13 +83,13 @@ jobs:
 
           # 2. 升级 Golang 到 23.x（Sing-Box 与 Xray-core 必需）
           rm -rf feeds/packages/lang/golang
-          git clone --depth=1 https://github.com/sbwml/packages_lang_golang -b 23.x feeds/packages/lang/golang
+          git clone --depth=1 [https://github.com/sbwml/packages_lang_golang](https://github.com/sbwml/packages_lang_golang) -b 23.x feeds/packages/lang/golang
 
           # 3. 彻底清理旧目录，避免冲突
           rm -rf package/helloworld package/passwall*
 
           # 4. 拉取 openwrt_helloworld v5（自带原生 luci-app-passwall2 与全套核心源码）
-          git clone --depth=1 https://github.com/sbwml/openwrt_helloworld.git -b v5 package/helloworld
+          git clone --depth=1 [https://github.com/sbwml/openwrt_helloworld.git](https://github.com/sbwml/openwrt_helloworld.git) -b v5 package/helloworld
 
           # 5. 安装 feeds 并建立依赖符号链接
           ./scripts/feeds install -a
@@ -263,7 +263,7 @@ jobs:
           echo
           echo "=== 6. 版本与 opkg 源（决定刷完后 opkg update 能否成功）==="
           grep -E '^CONFIG_VERSION_(NUMBER|REPO)=' .config || true
-          if ! grep -q '^CONFIG_VERSION_REPO="https://downloads.immortalwrt.org/releases/24.10.6"' .config; then
+          if ! grep -q '^CONFIG_VERSION_REPO="[https://downloads.immortalwrt.org/releases/24.10.6](https://downloads.immortalwrt.org/releases/24.10.6)"' .config; then
             echo "::error::VERSION_REPO 未生效或指向意外地址，刷完后 opkg 源可能不可用"
             fail=1
           else
@@ -326,16 +326,45 @@ jobs:
             echo
             echo '#### ② 编译日志尾部 80 行'
             echo '```text'
-      - name: Organize & Upload firmware to Artifacts
+            printf '%s\n' "$TAILB"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}" || true
+
+          echo "---- 致命错误汇总 ----"
+          if [ -n "$ERRS" ]; then printf '%s\n' "$ERRS"; else echo "(无直接特征匹配)"; fi
+          echo "---- 日志最后 80 行 ----"
+          printf '%s\n' "$TAILB"
+
+          if [ -n "$ERRS" ]; then
+            echo "::error title=编译错误特征匹配::$(printf '\%s\n' "$ERRS" | head -c 20000 | esc)"
+          fi
+          echo "::error title=构建日志尾部输出::$(printf '\%s\n' "$TAILB" | head -c 20000 | esc)"
+          exit 1
+
+      - name: Organize output firmware
+        if: always() && steps.build.outcome == 'success'
+        run: |
+          cd openwrt/bin/targets/mediatek/filogic
+          echo "==== 产物目录完整清单 ===="
+          ls -lh
+          
+          # 创建统一交付目录，精准抓取所有二进制固件和清单
+          mkdir -p "$GITHUB_WORKSPACE/firmware_out"
+          cp -f *bin* "$GITHUB_WORKSPACE/firmware_out/" 2>/dev/null || true
+          cp -f *manifest* "$GITHUB_WORKSPACE/firmware_out/" 2>/dev/null || true
+          cp -f sha256sums "$GITHUB_WORKSPACE/firmware_out/" 2>/dev/null || true
+          cp -f config.buildinfo "$GITHUB_WORKSPACE/firmware_out/" 2>/dev/null || true
+          cp -f profiles.json "$GITHUB_WORKSPACE/firmware_out/" 2>/dev/null || true
+          
+          echo "==== 准备打包的文件列表 ===="
+          ls -lh "$GITHUB_WORKSPACE/firmware_out"
+
+      - name: Upload firmware to Artifacts
         if: always() && steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: immortalwrt-24.10.6-nx30pro-passwall2-${{ github.run_number }}
-          path: |
-            openwrt/bin/targets/mediatek/filogic/*nx30-pro*
-            openwrt/bin/targets/mediatek/filogic/sha256sums
-            openwrt/bin/targets/mediatek/filogic/config.buildinfo
-            openwrt/bin/targets/mediatek/filogic/profiles.json
+          path: ${{ github.workspace }}/firmware_out/
           if-no-files-found: error
           retention-days: 30
 
@@ -352,5 +381,4 @@ jobs:
             - **移除项**：彻底剔除 ZeroTier 及其依赖库
             - **刷机说明**：进入 U-Boot Failsafe 界面（`192.168.1.1`），上传 `*-factory.bin` 刷入。
           prerelease: true
-          files: |
-            openwrt/bin/targets/mediatek/filogic/*nx30-pro*
+          files: ${{ github.workspace }}/firmware_out/*
