@@ -163,78 +163,56 @@ jobs:
                  "NX30 Pro NMBM 设备未被选中"
           chk_on CONFIG_TARGET_PER_DEVICE_ROOTFS "未按设备裁剪 rootfs，体积会失控"
 
-          echo "=== 2. 代理包与子选项（拼写取自锁定 feed commit 的 Makefile）==="
-          chk_on CONFIG_PACKAGE_luci-app-passwall "feeds 里可能没有该包"
-          chk_on CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray "xray 核心缺失，固件将无法代理"
-          chk_on CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Hysteria "Hysteria2 客户端缺失（包名是 hysteria，装的却是 2.6.5）"
-          chk_on CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Shadowsocks_Rust_Client "SS 客户端缺失"
-          chk_on CONFIG_PACKAGE_luci-app-passwall_INCLUDE_V2ray_Geodata "geoip/geosite 数据缺失"
-          # 十个 INCLUDE_* 关闭项逐条断言。它们在 aarch64 上大多「默认 y」，
-          # 只要有一条悄悄翻回 y，就会多带 0.14–40 MB 的无用二进制（全开共 97.8 MB）。
-          for k in SingBox Xray_Plugin V2ray_Plugin NaiveProxy \
+          echo "=== 2. 代理包与子选项（PassWall 2 + Fake-IP 架构）==="
+          chk_on CONFIG_PACKAGE_luci-app-passwall2 "feeds 里可能没有 luci-app-passwall2"
+          chk_on CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_SingBox "SingBox 核心缺失，Fake-IP 与分流将无法启动"
+          chk_on CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_Xray "Xray 核心缺失，节点将无法代理"
+          chk_on CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_Hysteria "Hysteria2 客户端缺失"
+          chk_on CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_Shadowsocks_Rust_Client "SS 客户端缺失"
+          chk_on CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_V2ray_Geodata "geoip/geosite 规则分流数据缺失"
+          chk_on CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_ChinaDNS_NG "ChinaDNS-NG 核心缺失"
+
+          # 关闭非必要组件，节省固件闪存空间（排除 SingBox，因为 Fake-IP 必需开启）
+          for k in Xray_Plugin V2ray_Plugin NaiveProxy \
                    Shadowsocks_Rust_Server V2ray_Geoview Shadow_TLS \
                    tuic_client Simple_Obfs Haproxy; do
-            chk_off "CONFIG_PACKAGE_luci-app-passwall_INCLUDE_$k" \
-                    "该组件默认开启，打开会多带 0.14–40 MB 无用二进制"
+            chk_off "CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_$k" \
+                    "该组件非必须，开启会增大固件体积"
           done
 
-          echo "  --- 中文界面开关（机制见配置文件 LuCI 段注释）---"
-          # 汉化包 luci-i18n-*-zh-cn 是 HIDDEN 的派生包：luci.mk 给它们
-          # HIDDEN:=1 + DEFAULT:=LUCI_LANG_zh_Hans||(ALL&&m)，而
-          # package-metadata.pl 对 hidden 包会清空 prompt，取值交给 default 求值。
-          # 所以真正要断言的是**带 prompt 的总开关** LUCI_LANG_zh_Hans，
-          # 逐包断言作为派生结果核对。
+          echo "  --- 中文界面开关 ---"
           chk_on CONFIG_LUCI_LANG_zh_Hans "中文界面总开关；关掉后 LuCI 会退回英文"
-          for p in base firewall package-manager argon-config passwall ttyd upnp zerotier; do
+          # 已移除 zerotier 汉化断言，并将 passwall 汉化更新为 passwall2
+          for p in base firewall package-manager argon-config passwall2 ttyd upnp; do
             chk_on "CONFIG_PACKAGE_luci-i18n-$p-zh-cn" "该应用的汉化包缺失，界面会是英文"
           done
 
-          if [ ! -d package/feeds/luci/luci-app-passwall ]; then
-            echo "::error::package/feeds/luci/luci-app-passwall 不存在，feeds 不完整"
+          # 兼容 package/helloworld 与 feeds 两种源码路径
+          if [ ! -d package/helloworld/luci-app-passwall2 ] && [ ! -d package/feeds/luci/luci-app-passwall2 ]; then
+            echo "::error::未检测到 luci-app-passwall2 源码目录"
             fail=1
           fi
 
           # ── feeds 源码目录存在性检查 ──────────────────────────────────
-          # 这里有两个必须注意的点，写错了断言会成片误报：
-          #  ① ./scripts/feeds install 建的是**符号链接**（见 scripts/feeds 的
-          #     do_install_src：`ln -sf ../../../$path ./package/feeds/<feed>/`）。
-          #     find 默认**不跟随**符号链接，裸用 -type d 永远匹配不到这些条目，
-          #     会 100% 误报「在 feeds 中缺失」。必须加 -L 跟随。
-          #  ② i18n 包在 feeds 里**没有独立源码目录** —— 它由 luci.mk 的
-          #     LuciTranslation 在宿主应用自己的目录内派生。目录检查只能覆盖
-          #     真正有源码目录的包，汉化包由上面的 chk_on 负责。
           check_src() {
-            if [ -n "$(find -L package/feeds -maxdepth 2 -type d -name "$1" -print -quit 2>/dev/null)" ]; then
+            if [ -n "$(find -L package/feeds package/helloworld -maxdepth 3 -type d -name "$1" -print -quit 2>/dev/null)" ]; then
               echo "  [就位]   $1"
             else
-              echo "::error::$1 在 feeds 中缺失，编译必然中途失败"
+              echo "::error::$1 源码缺失，编译必然中途失败"
               fail=1
             fi
           }
 
-          # passwall 的运行时依赖（xray-core / chinadns-ng 等）不在 .config 里显式
-          # 指定，而是靠依赖解析从 packages feed 拉入。若 feed 缺包，编译会在两小时
-          # 后才失败 —— 这里提前做目录存在性检查，把它变成几十秒内就暴露的错误。
-          echo "  --- passwall 运行时依赖是否已在 feeds 中就位 ---"
-          for p in xray-core hysteria shadowsocks-rust v2ray-geodata chinadns-ng \
+          echo "  --- PassWall 2 运行时依赖是否已就位 ---"
+          # 加入 sing-box 检查，确保 Fake-IP 与分流核心源码就位
+          for p in sing-box xray-core hysteria shadowsocks-rust v2ray-geodata chinadns-ng \
                    dns2socks ipt2socks microsocks tcping curl; do
             check_src "$p"
           done
 
-          echo "=== 2b. ZeroTier 组网（拼写取自锁定 feed commit 的 Makefile）==="
-          # 主包名是 zerotier，界面包名是 luci-app-zerotier。
-          # 注意两个子开关**不带 PACKAGE_ 前缀**（定义在 net/zerotier/Config.in，
-          # 默认就是 n），不显式断言的话日后误开也不会有人发现。
-          chk_on  CONFIG_PACKAGE_zerotier "VPN 主程序缺失，界面会在但没有任何后端"
-          chk_on  CONFIG_PACKAGE_luci-app-zerotier "界面缺失，只能靠命令行操作"
-          chk_off CONFIG_ZEROTIER_ENABLE_DEBUG "调试构建，体积更大且无用途"
-          chk_off CONFIG_ZEROTIER_ENABLE_SELFTEST "自测程序，无用途"
-
-          echo "  --- ZeroTier 源码目录是否已在 feeds 中就位 ---"
-          # luci-i18n-zerotier-zh-cn 刻意不在此列：它没有独立源码目录（原因见上）。
-          for p in zerotier luci-app-zerotier; do
-            check_src "$p"
-          done
+          echo "=== 2b. ZeroTier 组网（已按需彻底禁用）==="
+          chk_off CONFIG_PACKAGE_zerotier "已确认不构建 ZeroTier"
+          chk_off CONFIG_PACKAGE_luci-app-zerotier "已确认不构建 ZeroTier 界面"
 
           echo "=== 3. 内核模块（必须此刻编入：vermagic 改变后无法事后安装）==="
           # 前三个是 luci-app-passwall 的强制依赖（TProxy 透明代理必需）。
