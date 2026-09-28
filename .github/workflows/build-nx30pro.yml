@@ -103,24 +103,21 @@ jobs:
         run: |
           cd openwrt
 
-          # 1. 更新官方 feeds 索引
+          # 1. 更新官方基础 feeds 索引
           ./scripts/feeds update -a
 
-          # 2. 升级 Golang 至 1.23+（sing-box/xray 构建必需）
+          # 2. 升级 Golang 至 1.23+（sing-box / xray-core 编译必需）
           rm -rf feeds/packages/lang/golang
           git clone --depth=1 https://github.com/sbwml/packages_lang_golang -b 23.x feeds/packages/lang/golang
 
-          # 3. 清理旧目录
+          # 3. 清理已有的 passwall / helloworld 相关目录
           rm -rf package/helloworld package/passwall*
 
-          # 4. 克隆 PassWall 2 与配套二进制核心包（xiaorouji 官方 packages 仓库是 openwrt-passwall）
-          git clone --depth=1 https://github.com/xiaorouji/openwrt-passwall.git package/passwall-luci
-          # 提取或补齐 sing-box, xray-core, chinadns-ng, hysteria 等核心包源码
+          # 4. 仅克隆 sbwml 的 openwrt_helloworld（自带 passwall2 及全部二进制核心源码）
           git clone --depth=1 https://github.com/sbwml/openwrt_helloworld.git -b v5 package/helloworld
 
-          # 5. 关键：将 helloworld 和 passwall 中的包强制安装到 feeds 索引
-          ./scripts/feeds update -i
-          ./scripts/feeds install -a -f
+          # 5. 安装 feeds 并建立依赖符号链接
+          ./scripts/feeds install -a
       # ---------------------------------------------------------------
       # ccache：第二次及以后的编译能从数小时降到几十分钟。
       # 首次编译没有命中，属于正常现象。
