@@ -179,47 +179,23 @@ jobs:
 
           ./scripts/feeds install -a
 
-          # ── 先落一份 .config，再谈下载 ──
-          # 上一版在这里直接调 `make package/.../download`，但此时 openwrt/ 目录下
-          # 还没有 .config 文件。toplevel.mk 的规则是：任何目标都依赖 .config，
-          # 而 .config 不存在时它不会自动跑 defconfig，是去跑**交互式** menuconfig
-          # ——CI 里没有终端，于是报 "Error opening terminal: unknown."，
-          # 下载根本没有真正执行，"源码未能下载" 只是这个失败的次生报错。
-          # 这里先把自定义配置落成 .config 并非交互式跑一遍 defconfig，后面
-          # "Load config and verify selections" 步骤会用同样两行命令重新生成一次，
-          # 重复执行无害，只是为了在本步骤内也有一份合法 .config 可用。
-          cp ../nx30pro-nmbm.config .config
-          make defconfig
-
-          # ── Go 工具链兼容性预检 ──
-          # 新版 xray-core 的 go.mod 可能要求比锁定 golang 包更新的 Go。
-          # 版本不够时，golang 编译期就会报 "go.mod requires go >= X.Y" 之类的错，
-          # 但要等它排到编译队列才会暴露 —— 可能是几十分钟后。这里提前把该包的
-          # 源码单独下载下来，读 go.mod 里的 go 版本要求，与工具链版本比较，
-          # 不够就几分钟内直接报错，不必陪跑到编译阶段。
-          make package/feeds/packages/xray-core/download V=s 2>&1 | tail -30
-          XRAY_TARBALL=$(find dl -maxdepth 1 -name "xray-core-${XRAY_CORE_VERSION}.tar.gz" -print -quit 2>/dev/null || true)
-          if [ -z "$XRAY_TARBALL" ]; then
-            echo "::error::xray-core ${XRAY_CORE_VERSION} 源码未能下载，请确认该版本号（tag）确实存在于 XTLS/Xray-core"
-            exit 1
-          fi
-          GOMOD_LINE=$(tar -xzOf "$XRAY_TARBALL" --wildcards '*/go.mod' 2>/dev/null | grep -m1 -E '^go [0-9]+\.[0-9]+')
-          REQ_GO=$(echo "$GOMOD_LINE" | awk '{print $2}')
-          GOLANG_MK=$(find -L feeds/packages -maxdepth 3 -path '*lang/golang/golang/Makefile' -print -quit 2>/dev/null || true)
-          HAVE_GO=$(grep -m1 '^PKG_VERSION:=' "$GOLANG_MK" 2>/dev/null | cut -d= -f2 | cut -d. -f1,2)
-          echo "xray-core ${XRAY_CORE_VERSION} 的 go.mod 要求: go >= ${REQ_GO:-未知}"
-          echo "当前锁定的 Go 工具链版本: ${HAVE_GO:-未知}"
-          if [ -n "$REQ_GO" ] && [ -n "$HAVE_GO" ]; then
-            REQ_MAJOR=$(echo "$REQ_GO" | cut -d. -f1); REQ_MINOR=$(echo "$REQ_GO" | cut -d. -f2)
-            HAVE_MAJOR=$(echo "$HAVE_GO" | cut -d. -f1); HAVE_MINOR=$(echo "$HAVE_GO" | cut -d. -f2)
-            if [ "$HAVE_MAJOR" -lt "$REQ_MAJOR" ] || { [ "$HAVE_MAJOR" -eq "$REQ_MAJOR" ] && [ "$HAVE_MINOR" -lt "$REQ_MINOR" ]; }; then
-              echo "::error::Go 工具链（${HAVE_GO}）低于 xray-core ${XRAY_CORE_VERSION} 要求的 go ${REQ_GO}，编译到 xray-core 时会失败。"
-              echo "          需要同时升级 feeds/packages/lang/golang/golang 的 PKG_VERSION（并核对其 PKG_HASH），改动会影响全部 Go 语言包，请谨慎评估后再改。"
-              exit 1
-            fi
-          else
-            echo "::warning::未能读到 go.mod 版本要求或工具链版本，跳过兼容性预检，以实际编译结果为准"
-          fi
+          # 注意：xray-core 源码下载 + Go 工具链兼容性预检，挪到了
+          # "Load config and verify selections" 步骤末尾去做，而不是在这里。
+          # 原因（读了 openwrt/include/toplevel.mk 源码才确认）：
+          #   `make package/.../download` 匹配的是文件末尾的通用规则 `%::`，
+          #   它第一步会执行 `make prereq`，而 `prereq` 显式依赖 `.config` 这个
+          #   目标 —— 不是"文件"意义上的依赖，是 Makefile 目标依赖，且这个目标
+          #   的前置链里挂着一个 FORCE（伪目标，永远视为"过期"），所以 `.config`
+          #   目标自己的 recipe 每次都会重新执行一遍，而不是只在文件不存在时才跑。
+          #   它的 recipe 逻辑是：
+          #     [ ! -e .config ] || ! grep CONFIG_HAVE_DOT_CONFIG .config → 跑 menuconfig
+          #   也就是说，光靠本步骤里现凑一次 `cp .config; make defconfig` 并不
+          #   可靠——它是否会在 .config 里留下 CONFIG_HAVE_DOT_CONFIG=y 这个标记，
+          #   跟当时 feeds/Config.in 是否已经完全就绪等细节有关，我没能百分百确认。
+          #   "Load config and verify selections" 步骤里的 defconfig 调用已经被
+          #   完整跑通过一整条构建（曾经成功编出固件），是唯一确认可靠的落点，
+          #   所以把需要 .config 的操作都放到它之后做，而不是自己在这里再赌一次。
+          echo "xray-core 版本已改为 ${XRAY_CORE_VERSION}，源码下载与 Go 工具链兼容性预检将在下一步（Load config and verify selections）末尾进行"
 
           # 兜底：确保 passwall2 界面包来自这个 feed
           ./scripts/feeds install -f -p passwall2 luci-app-passwall2
@@ -256,6 +232,44 @@ jobs:
 
           cp ../nx30pro-nmbm.config .config
           make defconfig
+          # 双保险：不管 defconfig 有没有可靠写下这行，直接确保它在——这正是
+          # toplevel.mk 里 `.config:` 目标判断"要不要跑 menuconfig"的依据
+          # （见 "Update and install feeds" 步骤里的说明），写在这里能让本步骤
+          # 之后的所有 make 调用（download、build）都不会被判定为"未配置"。
+          grep -q '^CONFIG_HAVE_DOT_CONFIG=y' .config || echo 'CONFIG_HAVE_DOT_CONFIG=y' >> .config
+
+          # ── xray-core 源码下载 + Go 工具链兼容性预检 ──
+          # 放在这里（而不是上一步）的原因见 "Update and install feeds" 步骤里的
+          # 注释：这里的 .config 是唯一确认可靠、曾经支撑完整构建成功的落点。
+          #
+          # 新版 xray-core 的 go.mod 可能要求比锁定 golang 包更新的 Go。版本不够
+          # 时，golang 编译期才会报错，但要等排到编译队列才会暴露——可能是几十
+          # 分钟后。这里提前把该包的源码单独下载下来，读 go.mod 里的 go 版本
+          # 要求，与工具链版本比较，不够就几分钟内直接报错，不必陪跑到编译阶段。
+          make package/feeds/packages/xray-core/download V=s 2>&1 | tail -30
+          XRAY_TARBALL=$(find dl -maxdepth 1 -name "xray-core-${XRAY_CORE_VERSION}.tar.gz" -print -quit 2>/dev/null || true)
+          if [ -z "$XRAY_TARBALL" ]; then
+            echo "::error::xray-core ${XRAY_CORE_VERSION} 源码未能下载，请确认该版本号（tag）确实存在于 XTLS/Xray-core"
+            exit 1
+          fi
+          echo "  [OK]      xray-core ${XRAY_CORE_VERSION} 源码已下载：$(basename "$XRAY_TARBALL")"
+          GOMOD_LINE=$(tar -xzOf "$XRAY_TARBALL" --wildcards '*/go.mod' 2>/dev/null | grep -m1 -E '^go [0-9]+\.[0-9]+')
+          REQ_GO=$(echo "$GOMOD_LINE" | awk '{print $2}')
+          GOLANG_MK=$(find -L feeds/packages -maxdepth 3 -path '*lang/golang/golang/Makefile' -print -quit 2>/dev/null || true)
+          HAVE_GO=$(grep -m1 '^PKG_VERSION:=' "$GOLANG_MK" 2>/dev/null | cut -d= -f2 | cut -d. -f1,2)
+          echo "xray-core ${XRAY_CORE_VERSION} 的 go.mod 要求: go >= ${REQ_GO:-未知}"
+          echo "当前锁定的 Go 工具链版本: ${HAVE_GO:-未知}"
+          if [ -n "$REQ_GO" ] && [ -n "$HAVE_GO" ]; then
+            REQ_MAJOR=$(echo "$REQ_GO" | cut -d. -f1); REQ_MINOR=$(echo "$REQ_GO" | cut -d. -f2)
+            HAVE_MAJOR=$(echo "$HAVE_GO" | cut -d. -f1); HAVE_MINOR=$(echo "$HAVE_GO" | cut -d. -f2)
+            if [ "$HAVE_MAJOR" -lt "$REQ_MAJOR" ] || { [ "$HAVE_MAJOR" -eq "$REQ_MAJOR" ] && [ "$HAVE_MINOR" -lt "$REQ_MINOR" ]; }; then
+              echo "::error::Go 工具链（${HAVE_GO}）低于 xray-core ${XRAY_CORE_VERSION} 要求的 go ${REQ_GO}，编译到 xray-core 时会失败。"
+              echo "          需要同时升级 feeds/packages/lang/golang/golang 的 PKG_VERSION（并核对其 PKG_HASH），改动会影响全部 Go 语言包，请谨慎评估后再改。"
+              exit 1
+            fi
+          else
+            echo "::warning::未能读到 go.mod 版本要求或工具链版本，跳过兼容性预检，以实际编译结果为准"
+          fi
 
           fail=0
           chk_on() {   # chk_on  <符号>  <说明>
