@@ -30,6 +30,9 @@ env:
   # 之前的做法是把 passwall2 回退到旧提交去将就老 xray；现在反过来，把
   # xray-core 本身升级到指定版本，让它认识新协议，passwall2 就可以跟着上游最新版本走。
   XRAY_CORE_VERSION: "26.9.9"
+  # 下限：低于这个版本已知不认识 "tunnel" 协议（见上），无论 XRAY_CORE_VERSION
+  # 改成多少，都会在 "Update and install feeds" 步骤里被硬性拦下。
+  MIN_XRAY_CORE_VERSION: "26.7.11"
   # 官方 24.10.6 内核的 vermagic（来源：发布站 kmods 目录名）。
   # 我们自编译的内核配置不同，vermagic 必然与之不同 —— 这是正常且预期的，
   # 下面只把它打印出来，便于你日后确认「哪些 kmod 是本固件自带的」。
@@ -158,11 +161,35 @@ jobs:
             echo "::error::找不到 $XRAY_MK，feeds 结构可能变了"
             exit 1
           fi
+          # 版本下限：不管 XRAY_CORE_VERSION 改成什么，都不能低于 MIN_XRAY_CORE_VERSION。
+          # 用 sort -V 比较：把两个版本号排序后，最小的排第一；若排第一的不是
+          # MIN_XRAY_CORE_VERSION 本身，说明 XRAY_CORE_VERSION 比下限还低。
+          LOWEST=$(printf '%s\n%s\n' "$MIN_XRAY_CORE_VERSION" "$XRAY_CORE_VERSION" | sort -V | head -1)
+          if [ "$LOWEST" != "$MIN_XRAY_CORE_VERSION" ]; then
+            echo "::error::XRAY_CORE_VERSION=${XRAY_CORE_VERSION} 低于要求的下限 ${MIN_XRAY_CORE_VERSION}（该版本以下不认识 tunnel 协议，会导致 passwall2 报 unknown config id: tunnel）"
+            exit 1
+          fi
+          echo "版本下限检查通过：${XRAY_CORE_VERSION} >= ${MIN_XRAY_CORE_VERSION}"
+
           OLD_XRAY_VER=$(grep -m1 '^PKG_VERSION:=' "$XRAY_MK" | cut -d= -f2)
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${XRAY_CORE_VERSION}/" "$XRAY_MK"
           sed -i "s/^PKG_HASH:=.*/PKG_HASH:=skip/" "$XRAY_MK"
           echo "xray-core 版本已从 $OLD_XRAY_VER 改为 ${XRAY_CORE_VERSION}（源码哈希改为 skip，即改为直接校验下载是否完整，不再核对内容哈希）"
           grep -nE '^(PKG_VERSION|PKG_HASH|PKG_SOURCE_URL)' "$XRAY_MK"
+
+          ./scripts/feeds install -a
+
+          # ── 先落一份 .config，再谈下载 ──
+          # 上一版在这里直接调 `make package/.../download`，但此时 openwrt/ 目录下
+          # 还没有 .config 文件。toplevel.mk 的规则是：任何目标都依赖 .config，
+          # 而 .config 不存在时它不会自动跑 defconfig，是去跑**交互式** menuconfig
+          # ——CI 里没有终端，于是报 "Error opening terminal: unknown."，
+          # 下载根本没有真正执行，"源码未能下载" 只是这个失败的次生报错。
+          # 这里先把自定义配置落成 .config 并非交互式跑一遍 defconfig，后面
+          # "Load config and verify selections" 步骤会用同样两行命令重新生成一次，
+          # 重复执行无害，只是为了在本步骤内也有一份合法 .config 可用。
+          cp ../nx30pro-nmbm.config .config
+          make defconfig
 
           # ── Go 工具链兼容性预检 ──
           # 新版 xray-core 的 go.mod 可能要求比锁定 golang 包更新的 Go。
@@ -170,7 +197,6 @@ jobs:
           # 但要等它排到编译队列才会暴露 —— 可能是几十分钟后。这里提前把该包的
           # 源码单独下载下来，读 go.mod 里的 go 版本要求，与工具链版本比较，
           # 不够就几分钟内直接报错，不必陪跑到编译阶段。
-          ./scripts/feeds install -a
           make package/feeds/packages/xray-core/download V=s 2>&1 | tail -30
           XRAY_TARBALL=$(find dl -maxdepth 1 -name "xray-core-${XRAY_CORE_VERSION}.tar.gz" -print -quit 2>/dev/null || true)
           if [ -z "$XRAY_TARBALL" ]; then
