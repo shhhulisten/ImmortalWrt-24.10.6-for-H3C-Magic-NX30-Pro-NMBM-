@@ -78,10 +78,10 @@ jobs:
         run: |
           cd openwrt
 
-          # 1. 更新官方基础 feeds 索引
+          # 1. 基础 feeds 索引更新
           ./scripts/feeds update -a
 
-          # 2. 升级 Golang 至 1.23+（sing-box / xray-core 编译必需）
+          # 2. 升级 Golang 到 23.x（Sing-Box 与 Xray-core 必需）
           rm -rf feeds/packages/lang/golang
           git clone --depth=1 https://github.com/sbwml/packages_lang_golang -b 23.x feeds/packages/lang/golang
 
@@ -108,11 +108,12 @@ jobs:
 
       - name: Load config and verify selections
         run: |
-          echo "==== 载入配置文件 ===="
+          echo "==== 载入并清洗配置文件 ===="
           CONFIG_FILE=$(find "$GITHUB_WORKSPACE" -maxdepth 3 -type f \( -name "nx30pro-nmbm.config" -o -name "*nx30pro*.conf" -o -name ".config" \) ! -path "*/openwrt/*" | head -n 1)
           if [ -n "$CONFIG_FILE" ] && [ -f "$CONFIG_FILE" ]; then
             echo "找到目标配置文件: $CONFIG_FILE"
-            cp -f "$CONFIG_FILE" openwrt/.config
+            # 清洗非法 UTF-8 NBSP 不间断空格及 CRLF 换行
+            sed -e 's/\xc2\xa0/ /g' -e 's/\r$//' "$CONFIG_FILE" > openwrt/.config
           else
             echo "::error::未找到 nx30pro-nmbm.config！"
             exit 1
@@ -149,8 +150,7 @@ jobs:
 
           echo "=== 2. 代理包与子选项（PassWall 2 + Fake-IP + 分流架构）==="
           chk_on CONFIG_PACKAGE_luci-app-passwall2 "feeds 里可能没有 luci-app-passwall2"
-          
-          # 双向兼容检查核心开关（同时支持 Makefile 连字符与宏命名）
+
           chk_core() {
             local label="$1"
             shift
@@ -172,10 +172,9 @@ jobs:
           chk_core "Xray 核心" CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_xray CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_Xray CONFIG_PACKAGE_xray-core
           chk_core "Hysteria2 客户端" CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_hysteria CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_Hysteria CONFIG_PACKAGE_hysteria
           chk_core "Shadowsocks-Rust 客户端" CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_shadowsocks-rust CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_Shadowsocks_Rust_Client CONFIG_PACKAGE_shadowsocks-rust-sslocal
-          chk_core "规则分流数据 (GeoIP/GeoSite)" CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_geodata CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_v2ray-geodata CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_V2ray_Geodata CONFIG_PACKAGE_v2ray-geodata
           chk_core "ChinaDNS-NG 分流引擎" CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_chinadns-ng CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_ChinaDNS_NG CONFIG_PACKAGE_chinadns-ng
+          chk_core "规则分流数据 (GeoIP/GeoSite)" CONFIG_PACKAGE_v2ray-geoip CONFIG_PACKAGE_v2ray-geosite CONFIG_PACKAGE_v2ray-geodata CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_geodata CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_v2ray-geodata CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_V2ray_Geodata
 
-          # 关闭非必要组件，节省固件闪存空间（排除 SingBox）
           for k in Xray_Plugin V2ray_Plugin NaiveProxy \
                    Shadowsocks_Rust_Server V2ray_Geoview Shadow_TLS \
                    tuic_client Simple_Obfs Haproxy; do
@@ -189,7 +188,6 @@ jobs:
             chk_on "CONFIG_PACKAGE_luci-i18n-$p-zh-cn" "该应用的汉化包缺失，界面会是英文"
           done
 
-          # 源码目录存在性检查
           if [ ! -d package/helloworld/luci-app-passwall2 ] && [ ! -d package/feeds/luci/luci-app-passwall2 ]; then
             echo "::error::未检测到 luci-app-passwall2 源码目录"
             fail=1
@@ -216,10 +214,18 @@ jobs:
 
           echo "=== 3. 内核模块（必须此刻编入：vermagic 改变后无法事后安装）==="
           for k in kmod-nft-socket kmod-nft-tproxy kmod-nft-nat \
-                   kmod-zram kmod-nft-fullconenat kmod-tcp-bbr kmod-tun \
+                   kmod-zram kmod-tcp-bbr kmod-tun \
                    kmod-inet-diag kmod-netlink-diag kmod-wireguard kmod-sched-cake; do
             chk_on "CONFIG_PACKAGE_$k" "该模块将来无法用 opkg 补装"
           done
+
+          # 针对 24.10 内核下的 fullcone 命名做双向兼容断言
+          if grep -q "^CONFIG_PACKAGE_kmod-nft-fullcone=y" .config || grep -q "^CONFIG_PACKAGE_kmod-nft-fullconenat=y" .config; then
+            echo "  [OK]      kmod-nft-fullcone (全锥型 NAT 模块)"
+          else
+            echo "  [缺失!!]  kmod-nft-fullcone 核心在 .config 中未开启"
+            fail=1
+          fi
 
           echo "=== 4. UPnP 后端与 DNS 劫持依赖 ==="
           chk_on CONFIG_PACKAGE_miniupnpd-nftables "选了 iptables 变体在 firewall4 下不工作"
@@ -295,7 +301,6 @@ jobs:
             exit 0
           fi
 
-          # ---------- 编译失败诊断与上报 ----------
           esc() { sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN{ORS=""} {print $0 "%0A"}'; }
 
           if [ ! -f "$LOG" ]; then
@@ -321,140 +326,3 @@ jobs:
             echo
             echo '#### ② 编译日志尾部 80 行'
             echo '```text'
-            printf '%s\n' "$TAILB"
-            echo '```'
-          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}" || true
-
-          echo "---- 致命错误汇总 ----"
-          if [ -n "$ERRS" ]; then printf '%s\n' "$ERRS"; else echo "(无直接特征匹配)"; fi
-          echo "---- 日志最后 80 行 ----"
-          printf '%s\n' "$TAILB"
-
-          if [ -n "$ERRS" ]; then
-            echo "::error title=编译错误特征匹配::$(printf '\%s\n' "$ERRS" | head -c 20000 | esc)"
-          fi
-          echo "::error title=构建日志尾部输出::$(printf '\%s\n' "$TAILB" | head -c 20000 | esc)"
-          exit 1
-
-      - name: Verify artifacts and report sizes
-        id: verify
-        run: |
-          cd openwrt/bin/targets/mediatek/filogic
-          echo "=== 目标镜像 ==="
-          ls -lh *h3c_magic-nx30-pro-nmbm* || true
-          echo
-          echo "=== rootfs 与内核 ==="
-          ls -lh *rootfs* *kernel* 2>/dev/null || true
-          echo
-          echo "=== 本固件的内核 vermagic ==="
-          cd "$GITHUB_WORKSPACE/openwrt"
-          for d in build_dir bin/packages bin/targets/mediatek/filogic; do
-            [ -d "$d" ] || { echo "::error::工作目录基准错误：$d 不存在（当前 $(pwd)）"; exit 1; }
-          done
-          [ -f .config ] || { echo "::error::.config 不存在（当前 $(pwd)）"; exit 1; }
-          BIN=bin/targets/mediatek/filogic
-
-          find $BIN -name 'kmod-*.ipk' -printf '%f\n' 2>/dev/null | sort > kmods-built.txt || true
-          cp kmods-built.txt $BIN/kmods-built.txt 2>/dev/null || echo "::warning::未能把 kmods-built.txt 复制进产物目录"
-          cp .config $BIN/config.custom 2>/dev/null || echo "::warning::未能把 .config 复制进产物目录"
-          echo "内核模块清单已落盘：kmods-built.txt（$(wc -l < kmods-built.txt 2>/dev/null || echo 0) 行）"
-          echo
-
-          VF=$(find build_dir -name .vermagic -path '*linux-mediatek_filogic*' 2>/dev/null | head -1 || true)
-          if [ -n "$VF" ]; then
-            echo "vermagic = $(cat "$VF")"
-            echo "对照：官方 24.10.6 为 ${UPSTREAM_VERMAGIC}"
-          fi
-          echo
-          echo "=== 本固件自带的内核模块 ==="
-          head -60 kmods-built.txt || true
-          echo "(共 $(wc -l < kmods-built.txt 2>/dev/null || echo 0) 个；完整清单已存 kmods-built.txt 并随产物上传)"
-          echo
-          echo "=== 代理核心是否真的编出来了（PassWall 2 + Fake-IP 实证核对）==="
-          # 校验 passwall2 及其必须运行的核心（加入 sing-box 校验）
-          for p in sing-box xray-core hysteria shadowsocks-rust-sslocal; do
-            f=$(find bin/packages -name "${p}_*.ipk" -print -quit 2>/dev/null || true)
-            if [ -n "$f" ]; then
-              echo "  [已编出] $(basename "$f")"
-            else
-              echo "::error::$p 未出现在 bin/packages —— 固件将不含该代理核心"
-              exit 1
-            fi
-          done
-
-          # 验证 PassWall 2 主包界面产物
-          PWS=$(find bin/packages -name 'luci-app-passwall2_*.ipk' -print -quit 2>/dev/null || true)
-          if [ -n "$PWS" ]; then
-            echo "  [已编出] $(basename "$PWS")"
-          else
-            echo "::error::bin/packages 里没有 luci-app-passwall2_*.ipk —— PassWall 2 界面没编出来"
-            exit 1
-          fi
-
-          for p in v2ray-geoip v2ray-geosite ca-bundle chinadns-ng dns2socks ipt2socks microsocks tcping; do
-            f=$(find bin/packages -name "${p}_*.ipk" -print -quit 2>/dev/null || true)
-            if [ -n "$f" ]; then
-              echo "  [已编出] $(basename "$f")"
-            else
-              echo "::warning::$p 未找到，部分辅助功能可能受限"
-            fi
-          done
-
-          # TProxy 内核模块检查
-          for p in kmod-nft-socket kmod-nft-tproxy kmod-nft-nat; do
-            f=$(find bin/targets/mediatek/filogic -name "${p}_*.ipk" -print -quit 2>/dev/null || true)
-            if [ -n "$f" ]; then
-              echo "  [已编出] $(basename "$f")"
-            else
-              echo "::error::$p 缺失，TProxy 透明代理无法工作"
-              exit 1
-            fi
-          done
-          echo
-          echo "=== 空间账 ==="
-          SYS=$(ls -1$BIN/*h3c_magic-nx30-pro-nmbm-squashfs-sysupgrade.bin 2>/dev/null | head -1 || true)
-          if [ -n "$SYS" ]; then
-            SZ=$(stat -c \%s "$SYS")
-            echo "sysupgrade.bin = $((SZ/1024)) KB"
-            HEAD=$(( 67108864 - SZ ))
-            echo "ubi 分区 65536 KB，扣除镜像后余约 $((HEAD/1024)) KB 给 overlay"
-            if [ "$HEAD" -le 0 ]; then
-              echo "::error::镜像超过 ubi 分区容量"
-              exit 1
-            fi
-          fi
-          echo
-          echo "=== 产物目录总占用 ==="
-          du -sh $BIN || true
-
-      - name: Upload firmware
-        if: always() && steps.build.outcome == 'success'
-        uses: actions/upload-artifact@v4
-        with:
-          name: immortalwrt-24.10.6-nx30pro-nmbm-${{ github.run_number }}
-          path: |
-            openwrt/bin/targets/mediatek/filogic/*h3c_magic-nx30-pro-nmbm*
-            openwrt/bin/targets/mediatek/filogic/sha256sums
-            openwrt/bin/targets/mediatek/filogic/profiles.json
-            openwrt/bin/targets/mediatek/filogic/config.custom
-            openwrt/bin/targets/mediatek/filogic/kmods-built.txt
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Publish release
-        if: always() && steps.build.outcome == 'success' && steps.verify.outcome == 'success' && github.event_name != 'pull_request'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: build-${{ github.run_number }}
-          name: NX30 Pro NMBM PassWall 2 build ${{ github.run_number }}
-          body: |
-            基于 ImmortalWrt ${{ env.SRC_TAG }} 编译的 H3C Magic NX30 Pro（NMBM 布局）固件。
-
-            内置：PassWall 2（原生支持 Fake-IP、Sing-Box DNS 虚拟池、Xray、Hysteria2、SS-Rust 与规则分流）、UPnP (nftables)、zram-swap。
-            已彻底剔除 ZeroTier 及其依赖库。
-
-            刷写方式：进 U-Boot failsafe 界面（`http://192.168.1.1`），上传 `*-nmbm-squashfs-factory.bin`。不要刷 `-bl31-uboot.fip` 与 `-preloader.bin`。
-          prerelease: true
-          files: |
-            openwrt/bin/targets/mediatek/filogic/*h3c_magic-nx30-pro-nmbm*
-            openwrt/bin/targets/mediatek/filogic/kmods-built.txt
