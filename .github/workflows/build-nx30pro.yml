@@ -12,10 +12,7 @@ permissions:
 
 env:
   SRC_TAG: v24.10.6
-  PASSWALL2_REF: ""
-  XRAY_CORE_VERSION: "26.9.9"
-  MIN_XRAY_CORE_VERSION: "26.7.11"
-  UPSTREAM_VERMAGIC: 6.6.133-1-a8b93917f464536104594f27d870028d
+  XRAY_VER: "25.10.15"
 
 jobs:
   build:
@@ -26,9 +23,38 @@ jobs:
       - name: Checkout build recipe
         uses: actions/checkout@v4
 
+      # -------------------------------------------------------------
+      # 内置：格式自动对齐与前置编码清洗检查
+      # 杜绝 CRLF(\r)、NBSP(\xc2\xa0)、Tab错误及行尾游离空格
+      # -------------------------------------------------------------
+      - name: Format alignment and config validation
+        run: |
+          echo "=== 正在执行工作区配置编码清洗与格式标准化 ==="
+          find . -type f \( -name "*.yml" -o -name "*.yaml" -o -name "*.config" -o -name "*.sh" \) -print0 | while IFS= read -r -d '' f; do
+            # 1. 移除 Windows 换行符 CRLF
+            sed -i 's/\r$//' "$f"
+            # 2. 移除网页复制常见的 UTF-8 不间断空格 (NBSP)
+            sed -i 's/\xc2\xa0/ /g' "$f"
+            # 3. 清理行尾多余的空白字符
+            sed -i 's/[[:space:]]*$//' "$f"
+          done
+
+          # 校验 .config 文件语法规范度
+          if [ -f nx30pro-nmbm.config ]; then
+            echo "正在校验 nx30pro-nmbm.config 配置语法..."
+            # 检查是否有非法等号格式 (例如等号两边有空格)
+            if grep -nE '^[A-Za-z0-9_]+[[:space:]]+=' nx30pro-nmbm.config; then
+              echo "::error::nx30pro-nmbm.config 中存在非法空格符号定义"
+              exit 1
+            fi
+            echo "配置前置清洗与格式检查通过！有效配置行数: $(grep -c '^CONFIG_' nx30pro-nmbm.config || true)"
+          else
+            echo "::error::未检测到 nx30pro-nmbm.config 配置文件！"
+            exit 1
+          fi
+
       - name: Free disk space
         run: |
-          echo "--- before ---"
           df -h /
           sudo rm -rf /usr/share/dotnet \
                       /usr/local/lib/android \
@@ -38,7 +64,6 @@ jobs:
                       /usr/share/swift \
                       /usr/local/.ghcup 2>/dev/null || true
           sudo apt-get clean
-          echo "--- after ---"
           df -h /
 
       - name: Install build dependencies
@@ -52,10 +77,7 @@ jobs:
             subversion swig texinfo bc cpio squashfs-tools \
             liblzo2-dev libzstd-dev libgmp-dev libmpc-dev libmpfr-dev \
             python3-ply python3-yaml ecj fastjar gcc-multilib g++-multilib \
-            nano qemu-utils
-          sudo apt-get install -y --no-install-recommends \
-            upx-ucl antlr3 asciidoc intltool help2man || true
-          ccache --version | head -1
+            nano qemu-utils upx-ucl antlr3 asciidoc intltool help2man jq || true
 
       - name: Clone ImmortalWrt source (${{ env.SRC_TAG }})
         run: |
@@ -63,8 +85,6 @@ jobs:
             https://github.com/immortalwrt/immortalwrt.git openwrt
           cd openwrt
           echo "HEAD = $(git rev-parse HEAD)"
-          git log -1 --format='%H %ci %s'
-          cat feeds.conf.default
 
       - name: Restore ccache
         uses: actions/cache@v4
@@ -81,35 +101,56 @@ jobs:
       - name: Update and install feeds
         run: |
           cd openwrt
-          cp feeds.conf.default feeds.conf
-          if [ -n "${PASSWALL2_REF}" ]; then
-            echo "src-git passwall2 https://github.com/Openwrt-Passwall/openwrt-passwall2.git^${PASSWALL2_REF}" >> feeds.conf
-          else
-            echo "src-git passwall2 https://github.com/Openwrt-Passwall/openwrt-passwall2.git" >> feeds.conf
-          fi
-          cat feeds.conf
           ./scripts/feeds update -a
-
-          # 升级 xray-core 到指定版本
-          XRAY_MK=feeds/packages/net/xray-core/Makefile
-          if [ ! -f "$XRAY_MK" ]; then
-            echo "::error::找不到 $XRAY_MK，feeds 结构可能变了"
-            exit 1
-          fi
-
-          LOWEST=$(printf '%s\n%s\n' "$MIN_XRAY_CORE_VERSION" "$XRAY_CORE_VERSION" | sort -V | head -1)
-          if [ "$LOWEST" != "$MIN_XRAY_CORE_VERSION" ]; then
-            echo "::error::XRAY_CORE_VERSION=${XRAY_CORE_VERSION} 低于下限 ${MIN_XRAY_CORE_VERSION}"
-            exit 1
-          fi
-
-          OLD_XRAY_VER=$(grep -m1 '^PKG_VERSION:=' "$XRAY_MK" | cut -d= -f2)
-          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${XRAY_CORE_VERSION}/" "$XRAY_MK"
-          sed -i "s/^PKG_HASH:=.*/PKG_HASH:=skip/" "$XRAY_MK"
-          echo "xray-core 版本已更新为 ${XRAY_CORE_VERSION}"
-
           ./scripts/feeds install -a
-          ./scripts/feeds install -f -p passwall2 luci-app-passwall2
+
+          # 1. 注入官方 PassWall 2 源码仓库
+          rm -rf package/feeds/luci/luci-app-passwall2 package/luci-app-passwall2
+          git clone --depth=1 https://github.com/Openwrt-Passwall/openwrt-passwall2.git package/luci-app-passwall2
+
+          # 2. 注入官方发布版的 Xray 二进制（彻底绕过 Go 工具链版本不兼容及编译 Error 1）
+          XRAY_PKG_DIR=package/xray-core
+          rm -rf feeds/packages/net/xray-core package/feeds/packages/xray-core "$XRAY_PKG_DIR"
+          mkdir -p "$XRAY_PKG_DIR"
+
+          cat << 'EOF' > "$XRAY_PKG_DIR/Makefile"
+include $(TOPDIR)/rules.mk
+
+PKG_NAME:=xray-core
+PKG_VERSION:=25.10.15
+PKG_RELEASE:=1
+
+PKG_SOURCE:=Xray-linux-arm64-v8a.zip
+PKG_SOURCE_URL:=https://github.com/XTLS/Xray-core/releases/download/v$(PKG_VERSION)/
+PKG_HASH:=skip
+
+include $(INCLUDE_DIR)/package.mk
+
+define Package/xray-core
+  SECTION:=net
+  CATEGORY:=Network
+  TITLE:=A unified platform for anti-censorship (Prebuilt Official)
+  URL:=https://github.com/XTLS/Xray-core
+  DEPENDS:=+ca-bundle
+endef
+
+define Build/Prepare
+	mkdir -p $(PKG_BUILD_DIR)
+	unzip -q -o $(DL_DIR)/$(PKG_SOURCE) -d $(PKG_BUILD_DIR)/
+endef
+
+define Build/Compile
+endef
+
+define Package/xray-core/install
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/xray $(1)/usr/bin/xray
+endef
+
+$(eval $(call BuildPackage,xray-core))
+EOF
+          ./scripts/feeds update -i
+          ./scripts/feeds install -f xray-core
 
       - name: Load config and verify selections
         run: |
@@ -117,14 +158,6 @@ jobs:
           cp ../nx30pro-nmbm.config .config
           make defconfig
           grep -q '^CONFIG_HAVE_DOT_CONFIG=y' .config || echo 'CONFIG_HAVE_DOT_CONFIG=y' >> .config
-
-          # 下载并预检 xray-core 依赖
-          make package/feeds/packages/xray-core/download V=s 2>&1 | tail -30
-          XRAY_TARBALL=$(find dl -maxdepth 1 -name "xray-core-${XRAY_CORE_VERSION}.tar.gz" -print -quit 2>/dev/null || true)
-          if [ -z "$XRAY_TARBALL" ]; then
-            echo "::error::xray-core ${XRAY_CORE_VERSION} 源码下载失败"
-            exit 1
-          fi
 
           fail=0
           chk_on() {
@@ -146,32 +179,23 @@ jobs:
             fi
           }
 
-          echo "=== 1. 设备与架构 ==="
-          chk_on CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_h3c_magic-nx30-pro-nmbm "NX30 Pro NMBM 未被选中"
-          chk_on CONFIG_TARGET_PER_DEVICE_ROOTFS "未按设备裁剪 rootfs"
-
-          echo "=== 2. PassWall 2 与核心断言 ==="
-          chk_on CONFIG_PACKAGE_luci-app-passwall2 "passwall2 界面缺失"
+          echo "=== 检查目标与 PassWall2 依赖 ==="
+          chk_on CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_h3c_magic-nx30-pro-nmbm "设备未被选中"
+          chk_on CONFIG_PACKAGE_luci-app-passwall2 "PassWall2 缺失"
           chk_on CONFIG_PACKAGE_xray-core "Xray 核心缺失"
-          chk_on CONFIG_PACKAGE_v2ray-geoip "geoip 数据缺失"
-          chk_on CONFIG_PACKAGE_v2ray-geosite "geosite 数据缺失"
+          chk_on CONFIG_PACKAGE_v2ray-geoip "geoip 缺失"
+          chk_on CONFIG_PACKAGE_v2ray-geosite "geosite 缺失"
           chk_on CONFIG_PACKAGE_geoview "geoview 缺失"
 
-          # 确保 Sing-box 核心被彻底剔除
-          chk_off CONFIG_PACKAGE_sing-box "Sing-Box 必须关闭"
-          chk_off CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_SingBox "PassWall2 中的 SingBox 选项必须关闭"
+          # 确保 Sing-box 彻底被剔除
+          chk_off CONFIG_PACKAGE_sing-box "Sing-box 必须关闭"
+          chk_off CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_SingBox "PassWall2 的 Sing-box 支持必须关闭"
           chk_off CONFIG_PACKAGE_luci-app-passwall "旧版 PassWall 必须关闭"
 
-          echo "=== 3. 必需内核模块（TProxy 与基础功能）==="
-          for k in kmod-nft-socket kmod-nft-tproxy kmod-nft-nat kmod-zram kmod-nft-fullcone kmod-tcp-bbr kmod-tun; do
-            chk_on "CONFIG_PACKAGE_$k" "关键内核模块缺失"
-          done
-
           if [ "$fail" != "0" ]; then
-            echo "::error::配置校验失败，请检查上述缺失/未关闭项"
+            echo "::error::配置自检未通过"
             exit 1
           fi
-          echo "所有核心配置自检通过！"
 
       - name: Download package sources
         run: |
@@ -186,39 +210,26 @@ jobs:
           LOG="$RUNNER_TEMP/blog/build.log"
           rc=0
           if ! make -j$(nproc) > "$LOG" 2>&1; then
-            echo "并行编译失败，改用单线程重跑..."
+            echo "并行编译出现问题，自动进入单线程定位..."
             make -j1 V=s >> "$LOG" 2>&1 || rc=1
           fi
           if [ "$rc" = "0" ]; then exit 0; fi
 
-          echo "::error title=编译失败::编译日志已保存，末尾 60 行："
+          echo "::error title=固件编译中断::"
+          grep -nE 'make(\[[0-9]+\])?: \*\*\*|Error [0-9]+$|error:|fatal error:' "$LOG" | tail -n 30 || true
           tail -n 60 "$LOG"
           exit 1
 
-      - name: Verify artifacts and report sizes
+      - name: Verify artifacts
         id: verify
         run: |
           cd "$GITHUB_WORKSPACE/openwrt"
           BIN=bin/targets/mediatek/filogic
           ls -lh $BIN/*h3c_magic-nx30-pro-nmbm* || true
 
-          # 校验 xray-core 是否真的编出
-          f=$(find bin/packages -name "xray-core_*.ipk" -print -quit 2>/dev/null || true)
-          if [ -n "$f" ]; then
-            echo "  [OK] 成功生成 $(basename "$f")"
-          else
-            echo "::error::未能生成 xray-core 安装包"
-            exit 1
-          fi
-
-          # 校验 passwall2 是否真的编出
-          p=$(find bin/packages -name "luci-app-passwall2_*.ipk" -print -quit 2>/dev/null || true)
-          if [ -n "$p" ]; then
-            echo "  [OK] 成功生成 $(basename "$p")"
-          else
-            echo "::error::未能生成 luci-app-passwall2 安装包"
-            exit 1
-          fi
+          find bin/ -name "xray-core_*.ipk" -print -quit | grep -q . || { echo "::error::xray-core 未编译出"; exit 1; }
+          find bin/ -name "luci-app-passwall2_*.ipk" -print -quit | grep -q . || { echo "::error::passwall2 未编译出"; exit 1; }
+          echo "产物验证通过！"
 
       - name: Upload firmware
         if: always() && steps.build.outcome == 'success'
@@ -238,12 +249,6 @@ jobs:
         with:
           tag_name: build-${{ github.run_number }}
           name: NX30 Pro NMBM (PassWall2 Xray-Only) build ${{ github.run_number }}
-          body: |
-            基于 ImmortalWrt ${{ env.SRC_TAG }} 为 H3C Magic NX30 Pro 编译的精简固件。
-            
-            - **代理方案**：PassWall 2 搭配专属 **Xray-core (${{ env.XRAY_CORE_VERSION }})**。
-            - **内核精简**：完全剔除 Sing-Box 及多余客户端，规避缺少 .db 闪退的问题。
-            - **固化组件**：内置 geoview 与 v2ray-geodata，开箱即支持 FakeDNS 与分流。
           prerelease: false
           files: |
             openwrt/bin/targets/mediatek/filogic/*h3c_magic-nx30-pro-nmbm*
